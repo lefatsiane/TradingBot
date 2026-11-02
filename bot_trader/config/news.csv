@@ -1,0 +1,16 @@
+time_utc,currency,impact,title
+2026-10-29T13:00:00Z,USD,high,FOMC rate decision
+2026-10-30T09:30:00Z,EUR,high,ECB press conference
+2026-10-31T08:00:00Z,GBP,medium,UK employment report
+2026-11-01T13:30:00Z,USD,high,US nonfarm payrolls
+2026-11-02T11:00:00Z,JPY,high,BOJ policy decision
+2026-11-04T13:30:00Z,USD,high,CPI inflation release
+2026-11-05T08:00:00Z,AUD,medium,RBA statement
+2026-11-06T13:00:00Z,EUR,high,ECB key rate announcement
+2026-11-07T10:00:00Z,GBP,high,BOE rate decision
+2026-11-08T09:00:00Z,NZD,medium,NZ inflation release
+2026-11-09T08:30:00Z,CHF,medium,SNB policy decision
+2026-11-10T13:30:00Z,USD,high,PCE inflation release
+2026-11-12T08:30:00Z,AUD,high,Australian employment report
+2026-11-13T09:00:00Z,EUR,high,Eurozone CPI flash
+2026-11-14T13:00:00Z,USD,high,Fed chair press conference
