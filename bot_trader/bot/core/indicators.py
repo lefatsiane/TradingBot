@@ -1,4 +1,5 @@
-#indicotors.py
+﻿"""Technical indicator helpers used throughout the trading bot."""
+
 from __future__ import annotations
 
 import math
@@ -19,6 +20,7 @@ def ema(values: Sequence[float], period: int) -> list[float]:
         return []
     if not _finite(values):
         raise ValueError("indicator inputs must be finite")
+
     alpha = 2.0 / (period + 1)
     result = [float(values[0])]
     for value in values[1:]:
@@ -49,9 +51,11 @@ def wilder(values: Sequence[float], period: int) -> list[float | None]:
         raise ValueError("period must be at least 1")
     if not _finite(values):
         raise ValueError("indicator inputs must be finite")
+
     result: list[float | None] = [None] * len(values)
     if len(values) < period:
         return result
+
     average = sum(values[:period]) / period
     result[period - 1] = average
     for index in range(period, len(values)):
@@ -63,9 +67,11 @@ def wilder(values: Sequence[float], period: int) -> list[float | None]:
 def atr(candles: Sequence[Candle], period: int = 14) -> list[float]:
     if period < 1:
         raise ValueError("period must be at least 1")
+
     ranges = true_ranges(candles)
     if not ranges:
         return []
+
     alpha = 1.0 / period
     result = [ranges[0]]
     for value in ranges[1:]:
@@ -75,13 +81,17 @@ def atr(candles: Sequence[Candle], period: int = 14) -> list[float]:
 
 
 def bollinger(
-    values: Sequence[float], period: int = 20, deviations: float = 2.0
+    values: Sequence[float],
+    period: int = 20,
+    deviations: float = 2.0,
 ) -> tuple[list[float | None], list[float | None], list[float | None]]:
     if period < 1 or deviations < 0:
         raise ValueError("invalid Bollinger parameters")
+
     middle: list[float | None] = [None] * len(values)
     upper: list[float | None] = [None] * len(values)
     lower: list[float | None] = [None] * len(values)
+
     for index in range(period - 1, len(values)):
         window = values[index - period + 1 : index + 1]
         mean = sum(window) / period
@@ -96,9 +106,11 @@ def bollinger(
 def rsi(values: Sequence[float], period: int = 14) -> list[float | None]:
     if period < 1:
         raise ValueError("period must be at least 1")
+
     result: list[float | None] = [None] * len(values)
     if len(values) <= period:
         return result
+
     changes = [values[i] - values[i - 1] for i in range(1, len(values))]
     gains = [max(change, 0.0) for change in changes]
     losses = [max(-change, 0.0) for change in changes]
@@ -122,6 +134,7 @@ def rsi(values: Sequence[float], period: int = 14) -> list[float | None]:
 def adx(candles: Sequence[Candle], period: int = 14) -> list[float | None]:
     if period < 1:
         raise ValueError("period must be at least 1")
+
     result: list[float | None] = [None] * len(candles)
     if len(candles) < 2 * period:
         return result
@@ -150,6 +163,7 @@ def adx(candles: Sequence[Candle], period: int = 14) -> list[float | None]:
     initial = [value for value in dx[period - 1 : first_dx + 1] if value is not None]
     if len(initial) < period:
         return result
+
     current_adx = sum(initial) / period
     result[first_dx] = current_adx
     for index in range(first_dx + 1, len(candles)):
