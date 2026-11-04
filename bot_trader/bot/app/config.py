@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from bot.adapters.broker import BrokerAccount
 from bot.core.strategy_a import StrategyAParams
+from bot.core.strategy_b import StrategyBParams
 
 if TYPE_CHECKING:
     from bot.adapters.sim_broker import SimCosts
@@ -177,6 +178,25 @@ class StrategyBSettings(StrictModel):
         if self.model_dump() != expected:
             raise ValueError("Strategy B parameters are fixed to the approved design values")
         return self
+
+    def to_params(self) -> StrategyBParams:
+        return StrategyBParams(
+            bollinger_period=self.bollinger_period,
+            bollinger_deviations=self.bollinger_deviations,
+            rsi_period=self.rsi_period,
+            rsi_oversold=self.rsi_oversold,
+            rsi_overbought=self.rsi_overbought,
+            adx_period=self.adx_period,
+            adx_quiet_max=self.adx_quiet_max,
+            atr_period=self.atr_period,
+            stop_lookback=self.stop_lookback,
+            stop_buffer_atr=self.stop_buffer_atr,
+            min_stop_atr=self.min_stop_atr,
+            max_stop_atr=self.max_stop_atr,
+            min_reward_r=self.min_reward_r,
+            time_stop_candles=self.time_stop_candles,
+            cooldown_bars_after_stop=self.cooldown_bars_after_stop,
+        )
 
 
 class Settings(StrictModel):

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from bot.core.strategy_b import propose
+from bot.app.config import load_settings
+from bot.core.strategy_b import StrategyBParams, propose
 from bot.core.types import Candle, ReasonCode, Side
 
 
@@ -24,6 +26,14 @@ def make_history(length: int = 300) -> list[Candle]:
             )
         )
     return candles
+
+
+def test_strategy_b_accepts_params_and_settings_conversion() -> None:
+    settings, _ = load_settings(Path(__file__).parents[1] / "settings.toml")
+    history = make_history()
+
+    assert propose(history, StrategyBParams()) == propose(history)
+    assert settings.strategy_b.to_params() == StrategyBParams()
 
 
 def test_strategy_b_rejects_non_h1_timeframe() -> None:
