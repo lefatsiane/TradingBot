@@ -17,7 +17,7 @@ from bot.adapters.sim_broker import (
 from bot.adapters.store import StateStore
 from bot.app.executor import RETURN_CODE_POLICY, Executor, result_policy
 from bot.core.clock import SimClock
-from bot.core.types import ExitReason, Side, SymbolSpec
+from bot.core.types import Candle, ExitReason, Side, SymbolSpec
 
 NOW = datetime(2026, 10, 26, 12, tzinfo=UTC)
 SPEC = SymbolSpec(
@@ -289,3 +289,19 @@ def test_reconcile_closes_store_row_from_exit_deal_when_position_is_gone(tmp_pat
         "SELECT close_reason FROM trades WHERE ticket = ?", (opened.trade.ticket,)
     ).fetchone()
     assert closed["close_reason"] == ExitReason.UNKNOWN.value
+
+
+def test_reconcile_identifies_broker_stop_exit_for_cooldown_tracking(tmp_path) -> None:
+    broker, store, executor = _executor(tmp_path)
+    opened = _open(executor)
+    assert opened.trade is not None
+    close_time = NOW + timedelta(hours=1)
+    broker.process_candle(
+        "EURUSD",
+        Candle(close_time, 1.1, 1.101, 1.098, 1.1),
+    )
+
+    report = executor.reconcile()
+
+    assert report.actions == (f"closed-in-store:{opened.trade.ticket}",)
+    assert store.last_stop_out_utc("EURUSD", "H1") == close_time.isoformat()

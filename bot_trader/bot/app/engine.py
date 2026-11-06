@@ -4,9 +4,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from math import isfinite
-from typing import BinaryIO
+from typing import BinaryIO, Literal
 
-from bot.adapters.broker import Tick
+from bot.adapters.broker import OrderRequest, Tick
 from bot.adapters.gateway import BrokerGateway
 from bot.adapters.store import AlertPayload, DecisionRecord, StateStore
 from bot.app.config import Settings, parse_sessions, startup_guard
@@ -35,7 +35,11 @@ from bot.core.risk import (
 from bot.core.sizing import SizeResult, size_trade
 from bot.core.strategy_a import propose as propose_a
 from bot.core.strategy_b import propose as propose_b
-from bot.core.timeutil import month_start_utc, trading_day_start_utc
+from bot.core.timeutil import (
+    month_start_utc,
+    next_trading_day_boundary_utc,
+    trading_day_start_utc,
+)
 from bot.core.types import (
     Candle,
     Decision,
@@ -43,6 +47,7 @@ from bot.core.types import (
     OpenRisk,
     Proposal,
     ReasonCode,
+    Side,
     StrategyResult,
     SymbolSpec,
 )
@@ -76,7 +81,7 @@ class EntryContext:
     candles: tuple[Candle, ...]
     now_utc: datetime
     spec: SymbolSpec
-    tick: Tick
+    tick: Tick | None
     specs: dict[str, SymbolSpec]
     open_risks: tuple[OpenRisk, ...] = ()
     pending_risks: tuple[OpenRisk, ...] = ()
@@ -89,10 +94,12 @@ class EntryContext:
     weekend_close_utc: datetime | None = None
     news_events: tuple[NewsEvent, ...] = ()
     news_calendar_valid: bool = True
+    strategy_mode: Literal["a", "b", "both"] = "both"
     stop_new: bool = False
     halted_daily: bool = False
     halted_monthly: bool = False
     halted_error: bool = False
+    margin_calculation_failed: bool = False
     data_error: bool = False
     check_passed: bool = True
 
@@ -126,7 +133,12 @@ def evaluate_candle(context: EntryContext) -> Decision:
     )
     if gate.reason is ReasonCode.WEEKEND_WINDOW:
         return _decision(context, at_utc, gate.reason)
-    if context.data_error or not context.candles or not _tick_is_fresh(context.tick, at_utc):
+    if (
+        context.data_error
+        or not context.candles
+        or context.tick is None
+        or not _tick_is_fresh(context.tick, at_utc)
+    ):
         return _decision(context, at_utc, ReasonCode.DATA_ERROR)
     rollover_at_utc = context.rollover_at_utc
     if (
@@ -199,6 +211,15 @@ def evaluate_candle(context: EntryContext) -> Decision:
         )
     if sizing.lots is None or sizing.actual_risk is None:
         return _decision(context, at_utc, ReasonCode.BELOW_MIN_LOT)
+    if context.margin_calculation_failed:
+        return _decision(
+            context,
+            at_utc,
+            ReasonCode.NO_MARGIN,
+            strategy=strategy,
+            proposal=result.proposal,
+            indicators=result.indicators,
+        )
 
     risk = evaluate_entry(
         symbol=context.symbol,
@@ -279,6 +300,21 @@ def _gate(
 
 
 def _propose(context: EntryContext) -> tuple[str, StrategyResult]:
+    if context.strategy_mode == "a":
+        if context.timeframe in context.settings.strategy_a.timeframes:
+            return "A", propose_a(context.candles, context.settings.strategy_a.to_params())
+        return "A", StrategyResult(None, ReasonCode.WARMUP)
+    if context.strategy_mode == "b":
+        if context.timeframe == "H1":
+            return (
+                "B",
+                propose_b(
+                    context.candles,
+                    context.settings.strategy_b.to_params(),
+                    timeframe=context.timeframe,
+                ),
+            )
+        return "B", StrategyResult(None, ReasonCode.WARMUP)
     if context.timeframe in context.settings.strategy_a.timeframes:
         result_a = propose_a(context.candles, context.settings.strategy_a.to_params())
         if result_a.proposal is not None or context.timeframe != "H1":
@@ -335,6 +371,17 @@ def _risk_limits(settings: Settings) -> RiskLimits:
     )
 
 
+def _include_lane_risks(
+    current: tuple[OpenRisk, ...],
+    lane_risks: list[OpenRisk],
+) -> tuple[OpenRisk, ...]:
+    known_symbols = {risk.symbol for risk in current}
+    additions = tuple(
+        risk for risk in lane_risks if risk.symbol not in known_symbols
+    )
+    return (*current, *additions)
+
+
 def _decision(
     context: EntryContext,
     at_utc: datetime,
@@ -377,27 +424,33 @@ class Engine:
         store: StateStore,
         executor: Executor,
         clock: Clock,
-        context_factory: Callable[[str, str, tuple[Candle, ...]], EntryContext],
+        context_factory: Callable[[str, str, tuple[Candle, ...]], EntryContext] | None = None,
         *,
         code_version: str,
         settings_version: str,
         news_enabled: bool = True,
+        strategy_mode: Literal["a", "b", "both"] = "both",
     ) -> None:
+        if strategy_mode not in ("a", "b", "both"):
+            raise ValueError("strategy_mode must be 'a', 'b', or 'both'")
         self._settings = settings
         self._gateway = gateway
         self._store = store
         self._executor = executor
         self._clock = clock
-        self._context_factory = context_factory
+        self._context_factory = context_factory or self._build_entry_context
         self._code_version = code_version
         self._settings_version = settings_version
         self._news_enabled = news_enabled
+        self._strategy_mode = strategy_mode
         self._news_events: tuple[NewsEvent, ...] = ()
         self._news_calendar_valid: bool | None = None
         self._instance_lock_file: BinaryIO | None = None
 
     def run_entry_lane(self) -> tuple[Decision, ...]:
         decisions: list[Decision] = []
+        accepted_risks: list[OpenRisk] = []
+        pending_risks: list[OpenRisk] = []
         if self._news_calendar_valid is not None:
             self._initialize_news_calendar()
         if self._gateway.degraded or self._store.get_meta("gateway_degraded") == "1":
@@ -406,8 +459,16 @@ class Engine:
             for symbol, symbol_settings in self._settings.symbols.items():
                 if not symbol_settings.enabled:
                     continue
-                timeframes = tuple(
-                    dict.fromkeys((*self._settings.strategy_a.timeframes, "H1"))
+                timeframes = (
+                    self._settings.strategy_a.timeframes
+                    if self._strategy_mode == "a"
+                    else ("H1",)
+                    if self._strategy_mode == "b"
+                    else tuple(
+                        dict.fromkeys(
+                            (*self._settings.strategy_a.timeframes, "H1")
+                        )
+                    )
                 )
                 for timeframe in timeframes:
                     now = _as_utc(self._clock.now_utc())
@@ -437,8 +498,15 @@ class Engine:
                         continue
 
                     context = self._context_factory(symbol, timeframe, window)
+                    context = self._with_server_schedule(context, now)
                     context = replace(
                         context,
+                        open_risks=_include_lane_risks(
+                            context.open_risks, accepted_risks
+                        ),
+                        pending_risks=_include_lane_risks(
+                            context.pending_risks, pending_risks
+                        ),
                         news_events=(
                             self._news_events
                             if self._news_calendar_valid is not None
@@ -449,6 +517,7 @@ class Engine:
                             if self._news_calendar_valid is not None
                             else context.news_calendar_valid
                         ),
+                        strategy_mode=self._strategy_mode,
                         bars_since_stop=self._bars_since_stop(
                             symbol, timeframe, window
                         ),
@@ -472,6 +541,14 @@ class Engine:
                         ),
                     )
                     decision = evaluate_candle(context)
+                    if decision.reason is ReasonCode.ENTRY_ALLOWED:
+                        assert decision.proposal is not None
+                        context = self._with_candidate_margin(
+                            context,
+                            decision.proposal,
+                            symbol_settings.commission_per_lot_side,
+                        )
+                        decision = evaluate_candle(context)
                     if decision.reason is ReasonCode.ENTRY_ALLOWED:
                         assert decision.proposal is not None
                         sized = _size(
@@ -504,13 +581,42 @@ class Engine:
                                 timeframe=timeframe,
                             )
                             if result.trade is None:
+                                outcome_unknown = result.intent.status in (
+                                    "PENDING",
+                                    "SENT",
+                                    "UNKNOWN",
+                                )
+                                if outcome_unknown:
+                                    pending_risks.append(
+                                        OpenRisk(
+                                            symbol,
+                                            decision.proposal.side,
+                                            sized.actual_risk / context.equity * 100.0,
+                                        )
+                                    )
+                                if outcome_unknown:
+                                    failure_reason = ReasonCode.UNKNOWN_OUTCOME
+                                elif result.reason == ReasonCode.STOP_NEW.value:
+                                    failure_reason = ReasonCode.STOP_NEW
+                                elif result.reason == ReasonCode.CHECK_FAILED.value:
+                                    failure_reason = ReasonCode.CHECK_FAILED
+                                else:
+                                    failure_reason = ReasonCode.SEND_FAILED
                                 decision = _decision(
                                     context,
                                     now,
-                                    ReasonCode.CHECK_FAILED,
+                                    failure_reason,
                                     strategy=decision.strategy,
                                     proposal=decision.proposal,
                                     indicators=decision.indicators,
+                                )
+                            else:
+                                accepted_risks.append(
+                                    OpenRisk(
+                                        symbol,
+                                        decision.proposal.side,
+                                        sized.actual_risk / context.equity * 100.0,
+                                    )
                                 )
 
                     record = DecisionRecord(
@@ -541,6 +647,193 @@ class Engine:
             )
             raise
         return tuple(decisions)
+
+    def _with_server_schedule(
+        self, context: EntryContext, now_utc: datetime
+    ) -> EntryContext:
+        server_offset = self._gateway.server_utc_offset_hours()
+        current_rollover = trading_day_start_utc(now_utc, server_offset)
+        if now_utc - current_rollover <= timedelta(
+            minutes=self._settings.timing.rollover_block_after_min
+        ):
+            rollover_at = current_rollover
+        else:
+            rollover_at = next_trading_day_boundary_utc(now_utc, server_offset)
+        weekend_close = next_weekend_close_utc(
+            now_utc,
+            parse_sessions(self._settings.symbols[context.symbol].hours_utc),
+        )
+        return replace(
+            context,
+            now_utc=now_utc,
+            rollover_at_utc=rollover_at,
+            weekend_close_utc=weekend_close,
+        )
+
+    def _build_entry_context(
+        self, symbol: str, timeframe: str, candles: tuple[Candle, ...]
+    ) -> EntryContext:
+        now = _as_utc(self._clock.now_utc())
+        account = self._gateway.account()
+        positions = self._gateway.positions(self._settings.account.magic_number)
+        pending_intents = tuple(
+            intent
+            for intent in self._store.unresolved_intents()
+            if intent.intent_key.startswith("trade|")
+        )
+        symbol_names = tuple(
+            dict.fromkeys(
+                (
+                    *(
+                        name
+                        for name, item in self._settings.symbols.items()
+                        if item.enabled
+                    ),
+                    *(position.symbol for position in positions),
+                    *(intent.symbol for intent in pending_intents),
+                )
+            )
+        )
+        specs = {
+            name: self._gateway.symbol_info(name)
+            for name in symbol_names
+        }
+        spec = specs.get(symbol)
+        if spec is None:
+            raise ValueError(f"No broker specification is available for {symbol}")
+        tick = self._gateway.tick(symbol)
+        data_error = account.equity <= 0 or tick is None
+        open_trades = {trade.ticket: trade for trade in self._store.open_trades()}
+        open_risks: list[OpenRisk] = []
+        margin_used = 0.0
+        margin_calculation_failed = False
+
+        for position in positions:
+            trade = open_trades.get(position.ticket)
+            if trade is None or position.stop_loss <= 0:
+                data_error = True
+                continue
+            risk_pct = (
+                trade.actual_risk / account.equity * 100
+                if account.equity > 0
+                else 0.0
+            )
+            open_risks.append(OpenRisk(position.symbol, position.side, risk_pct))
+            margin = self._gateway.calculate_margin(
+                OrderRequest(
+                    symbol=position.symbol,
+                    side=position.side,
+                    lots=position.lots,
+                    stop_loss=position.stop_loss,
+                    take_profit=position.take_profit,
+                    magic_number=self._settings.account.magic_number,
+                    intent_id=f"margin-open-{position.ticket}",
+                )
+            )
+            if margin is None or not isfinite(margin) or margin < 0:
+                margin_calculation_failed = True
+            else:
+                margin_used += margin
+
+        pending_risks: list[OpenRisk] = []
+        position_comments = {position.comment for position in positions}
+        for intent in pending_intents:
+            if str(intent.intent_id) in position_comments:
+                continue
+            side = Side(intent.side)
+            risk_pct = (
+                intent.actual_risk / account.equity * 100
+                if account.equity > 0
+                else 0.0
+            )
+            pending_risks.append(OpenRisk(intent.symbol, side, risk_pct))
+            margin = self._gateway.calculate_margin(
+                OrderRequest(
+                    symbol=intent.symbol,
+                    side=side,
+                    lots=intent.lots,
+                    stop_loss=intent.stop_loss,
+                    take_profit=intent.take_profit,
+                    magic_number=self._settings.account.magic_number,
+                    intent_id=f"margin-pending-{intent.intent_id}",
+                )
+            )
+            if margin is None or not isfinite(margin) or margin < 0:
+                margin_calculation_failed = True
+            else:
+                margin_used += margin
+
+        day_baseline = self._store.get_baseline("day")
+        if day_baseline is None or day_baseline[1] <= 0:
+            data_error = True
+            start_of_day_equity = 0.0
+            realized_pnl_today = 0.0
+        else:
+            day_start, start_of_day_equity = day_baseline
+            realized_pnl_today = self._store.realized_pnl_between(
+                day_start, now.isoformat()
+            )
+
+        return EntryContext(
+            settings=self._settings,
+            symbol=symbol,
+            timeframe=timeframe,
+            candles=candles,
+            now_utc=now,
+            spec=spec,
+            tick=tick,
+            specs=specs,
+            open_risks=tuple(open_risks),
+            pending_risks=tuple(pending_risks),
+            margin_used_after_pct=(
+                margin_used / account.equity * 100 if account.equity > 0 else 0.0
+            ),
+            realized_pnl_today=realized_pnl_today,
+            start_of_day_equity=start_of_day_equity,
+            equity=account.equity,
+            stop_new=(
+                self._store.get_flag("stop_new")
+                or self._store.get_flag("close_all_pending")
+            ),
+            halted_daily=self._store.get_flag("halted_daily"),
+            halted_monthly=self._store.get_flag("halted_monthly"),
+            halted_error=(
+                self._store.get_flag("halted_error")
+                or self._gateway.degraded
+                or self._store.get_meta("gateway_degraded") == "1"
+            ),
+            margin_calculation_failed=margin_calculation_failed,
+            data_error=data_error,
+        )
+
+    def _with_candidate_margin(
+        self,
+        context: EntryContext,
+        proposal: Proposal,
+        commission_per_lot_side: float,
+    ) -> EntryContext:
+        sized = _size(context, proposal, commission_per_lot_side)
+        if sized.lots is None:
+            return context
+        margin = self._gateway.calculate_margin(
+            OrderRequest(
+                symbol=context.symbol,
+                side=proposal.side,
+                lots=sized.lots,
+                stop_loss=proposal.stop_loss,
+                take_profit=proposal.take_profit,
+                magic_number=self._settings.account.magic_number,
+                intent_id="margin-entry-preview",
+            )
+        )
+        if margin is None or not isfinite(margin) or margin < 0:
+            return replace(context, margin_calculation_failed=True)
+        return replace(
+            context,
+            margin_used_after_pct=(
+                context.margin_used_after_pct + margin / context.equity * 100
+            ),
+        )
 
     def _bars_since_stop(
         self,
@@ -586,7 +879,40 @@ class Engine:
             positions = self._gateway.positions(self._settings.account.magic_number)
             if any(position.stop_loss <= 0 for position in positions):
                 raise RuntimeError("A broker position has no stop-loss after reconciliation")
-            self._initialize_baselines(account.equity)
+            baseline_account = self._gateway.account()
+            now = _as_utc(self._clock.now_utc())
+            offset = self._gateway.server_utc_offset_hours()
+            expected_baselines = {
+                "day": trading_day_start_utc(now, offset),
+                "month": month_start_utc(now, offset),
+            }
+            baseline_late_periods = tuple(
+                period
+                for period, boundary in expected_baselines.items()
+                if (
+                    (baseline := self._store.get_baseline(period)) is None
+                    or datetime.fromisoformat(baseline[0]) < boundary
+                )
+            )
+            self._initialize_baselines(baseline_account.equity)
+            if (
+                self._store.get_baseline("day") is None
+                or self._store.get_baseline("month") is None
+            ):
+                raise RuntimeError("Startup could not establish risk baselines")
+            if baseline_late_periods:
+                self._store.set_meta("baseline_late_utc", now.isoformat())
+                self._store.set_meta(
+                    "baseline_late_periods", ",".join(baseline_late_periods)
+                )
+                self._store.enqueue_alert(
+                    AlertPayload(
+                        now.isoformat(),
+                        "WARNING",
+                        "baseline_late: risk baselines were initialized late; "
+                        "limits are measured from current equity",
+                    )
+                )
             return self.run_management_lane()
         except Exception as error:
             self.stop()

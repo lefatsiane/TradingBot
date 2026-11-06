@@ -58,6 +58,7 @@ class IntentRecord:
     entry: float
     stop_loss: float
     take_profit: float
+    actual_risk: float
     status: IntentStatus
     created_at_utc: str
     ticket: str | None
@@ -844,6 +845,7 @@ class StateStore:
             entry=row["entry"],
             stop_loss=row["stop_loss"],
             take_profit=row["take_profit"],
+            actual_risk=row["actual_risk"],
             status=row["status"],
             created_at_utc=row["created_at_utc"],
             ticket=row["ticket"],

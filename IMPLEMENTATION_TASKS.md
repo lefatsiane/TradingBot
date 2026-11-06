@@ -234,60 +234,74 @@ All order traffic goes through this class, which uses `BrokerGateway`, `StateSto
 ## 6. Engine (`bot/app/engine.py`) in three parts
 
 ### 6a. Entry decision pipeline
-- [ ] `evaluate_candle(...) -> Decision` as a function (no I/O of its own: all inputs passed in).
-  Follow the **14 checks in the design record's order-of-checks table, cheapest first** (open the
-  SDLC Record and follow it word for word). Rough order: `STOP_NEW`, `DAILY_HALT`, `MONTHLY_HALT`,
-  `ERROR_HALT`, `WEEKEND_WINDOW`, `DATA_ERROR`, `SYMBOL_DISABLED`, `OUTSIDE_HOURS`, `NEWS_WINDOW` /
-  `NEWS_CALENDAR_STALE`, `ROLLOVER`, `SPREAD_WIDE`, `SKIP_VOLATILITY`, `SLOT_TAKEN`, `COOLDOWN`,
+- [x] `evaluate_candle(...) -> Decision` is a function with no I/O of its own; its inputs are passed
+  in through `EntryContext`.
+- [x] Reuse `evaluate_entry_gates`, the strategies, `size_trade`, `evaluate_entry` and `is_news_blocked`;
+  Strategy A is preferred when both strategies propose on the same symbol.
+- [x] Compute `bars_since_stop` from `store.last_stop_out_utc` and the timeframe.
+- [x] Follow the **14 checks in the design record's order-of-checks table, cheapest first** (verified
+  against the SDLC record's entry-check table).
+  The design order is `STOP_NEW`, `DAILY_HALT`, `MONTHLY_HALT`, `ERROR_HALT`, `WEEKEND_WINDOW`,
+  `DATA_ERROR`, `SYMBOL_DISABLED`, `OUTSIDE_HOURS`, `NEWS_WINDOW` / `NEWS_CALENDAR_STALE`,
+  `ROLLOVER`, `SPREAD_WIDE`, `SKIP_VOLATILITY`, `SLOT_TAKEN`, `COOLDOWN`,
   strategy skip, `COST_TOO_HIGH`, `BELOW_MIN_LOT`, `NO_MARGIN`, `MAX_TRADES`, `CURRENCY_EXPOSURE`,
   `DAILY_HEADROOM`, `CHECK_FAILED`.
-- [ ] Reuse `evaluate_entry_gates`, the strategies, `size_trade`, `evaluate_entry` and `is_news_blocked`;
-  do not re-implement their logic. If both strategies propose on the same symbol, Strategy A wins the slot.
-- [ ] Compute `bars_since_stop` from `store.last_stop_out_utc` and the timeframe.
-- [ ] **Tests:** one test per `ReasonCode` skip, in order, plus a case where two reasons apply and the
-  earlier one in the table wins.
+- [x] Add skip-reason tests for each evaluator and execution outcome, with precedence cases for
+  competing reasons.
 
 ### 6b. Entry lane
-- [ ] For each enabled symbol and each configured timeframe (A: H1 and H4, B: H1 only), in the
-  settings-file order: fetch candles via the gateway, keep only closed candles with `last_closed_candles`,
-  take the **last 1,000** (`window_candles`), and process only if the newest closed candle's open time
-  is later than `store.get_bar_progress`.
-- [ ] After each accepted trade, re-evaluate loss limits and exposure before the next symbol.
-- [ ] Persist every skip and entry in one transaction with `commit_candle_decisions` (progress,
-  decision rows, optional alert). A duplicate candle returns False and is ignored.
-- [ ] An unexpected exception in the entry lane sets `halted_error`, sends a critical alert, and
-  leaves the management lane running.
+- [x] For each enabled symbol and configured timeframe (A: H1 and H4, B: H1 only), in settings-file
+  order: fetch candles through the gateway, retain closed candles, cap the window at 1,000, and
+  process only bars newer than persisted progress.
+- [x] After each accepted trade, rebuild account/position/margin context and re-evaluate loss limits
+  and exposure before the next symbol.
+- [x] Persist each valid-candle decision with progress through `commit_candle_decisions`; duplicate
+  candles are ignored.
+- [x] Unexpected entry-lane exceptions set `halted_error`, enqueue a critical alert, and leave the
+  management lane callable.
 
-### 6c. Management lane (every `fast_tick_s`, runs even when entries are blocked)
-- [ ] Update the heartbeat timestamp; read account, positions, ticks (failure marks the gateway
-  degraded, alert once, entries blocked, retry with backoff).
-- [ ] Run `reconcile()`; run `evaluate_loss_limits` on equity incl. floating P&L; set `halted_daily`
-  (keep stop-losses on open trades) or `halted_monthly` (flatten everything via `close_position`).
-- [ ] Friday flatten: inside `flatten_before_weekend_close_min` of each symbol's `next_weekend_close_utc`,
-  close that symbol's bot positions (`ExitReason.WEEKEND_FLATTEN`).
-- [ ] Strategy B time stop: close a Strategy B trade still open after 24 H1 candles (`TIME_STOP`).
-  Strategy A sends no modifications, ever.
-- [ ] Apply control flags (`close_all_pending`, `stop_new`); `record_equity` once a minute; roll the
-  day baseline at server midnight and month baseline at server month start (`new_baseline`, write-once).
+### 6c. Management lane
+- [ ] Wire the lane to run every `fast_tick_s`, independently of entry eligibility (runtime wiring is
+  still open in section 10).
+- [x] On each call, update the heartbeat and read account, positions and ticks. A failed health check
+  marks the gateway degraded, alerts once, blocks entries and can recover on a later management call;
+  serialized gateway reads retry with backoff.
+- [x] Run `reconcile()` and evaluate loss limits on broker equity, including floating P&L. Daily halt
+  retains protected positions; monthly halt closes bot positions through `close_position`.
+- [x] Flatten each symbol inside `flatten_before_weekend_close_min` of its configured Friday close
+  (`ExitReason.WEEKEND_FLATTEN`).
+- [x] Close Strategy B H1 trades at the configured 24-closed-candle time stop (`TIME_STOP`); no
+  strategy-driven modifications are sent for Strategy A.
+- [x] Apply `close_all_pending` and `stop_new`; store equity snapshots once per minute and roll daily
+  and monthly baselines on broker-server boundaries.
 
 ### 6d. Startup recovery (nine steps, in the order given in the design record)
-- [ ] `Engine.start()`: guards (`startup_guard`) → settings hash → flags and baselines → read positions
-  → resolve unresolved intents → reconcile → check every position has a stop-loss → check baselines
-  → run the management lane once. Any failure: do not trade, critical alert.
-- [ ] **Tests (`tests/test_engine.py`):** a full replayed day on `SimBroker` with `SimClock` including a
-  Friday flatten, a news window, a rollover window, a daily-limit trip, a monthly-cap flatten, and a
-  restart mid-day (new Engine on the same DB resumes without duplicates).
+- [x] `Engine.start()` performs demo/startup guards, records the settings version, loads safety flags,
+  reads positions, resolves unresolved intents, reconciles, and checks every position has a stop-loss.
+- [x] Check and create current day/month baselines from post-reconciliation equity; record and alert
+  `baseline_late` when a baseline is missing or its period was missed. Run management once before
+  returning from startup. Startup failures halt and alert.
+- [x] **Tests (`tests/test_engine.py`):** deterministic multi-session `SimBroker` / `SimClock` acceptance
+  covers Friday flatten, a news window, rollover, daily-limit trip with protected-position retention,
+  monthly-cap flatten, and same-database restart without duplicate decisions.
 
 **Done when:** a week of replayed candles runs on `SimBroker` with no unexpected errors and no trade
 without a stop-loss.
 
-**Progress note:** evaluator, closed-bar entry processing, startup guards, and a callable management
-lane are implemented with focused simulator tests. Tests cover strategy/size/risk reason propagation,
-SDLC-ordered gate and risk precedence (including slot/cooldown before strategy evaluation),
-stored-stop cooldown counting, daily-halt stop retention, Friday flattening, and invalid
-closed-candle data without incorrectly halting management. Server-clock schedule/context wiring,
-end-to-end replayed day/week, and restart-midday acceptance are still incomplete; keep section 6
-open.
+**Progress note:** the pure evaluator, dependency reuse, stored-stop cooldown calculation, and
+SDLC-ordered skip handling are checked off above. The default engine context now reads account and
+market state, open positions, unresolved intents, protective-stop risk, realized daily P&L, and
+current margin through the gateway/store. Candidate margin is queried for the sized order before the
+final risk decision; unavailable margin data fails closed as `NO_MARGIN`. Tests cover context
+construction, candidate-margin limits, evaluator and execution skip reasons, and gate/risk precedence.
+The entry lane refreshes this context for each new symbol/timeframe and overlays same-pass accepted
+or unresolved risk. Remaining section 6 work is periodic runtime scheduling and full replayed day/week acceptance; keep
+section 6 open. Startup now detects missing or stale daily/monthly baselines, records `baseline_late`,
+and initializes from post-reconciliation equity. Unexpected entry-lane exceptions set `halted_error`,
+enqueue a critical alert, and leave management callable. A same-database midday restart test verifies
+position reconciliation and that persisted candle progress prevents duplicate decisions. The lane
+also derives rollover and weekend-close timestamps from the broker server offset and configured UTC
+schedule.
 
 ---
 

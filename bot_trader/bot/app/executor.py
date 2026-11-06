@@ -46,6 +46,20 @@ def result_policy(code: str | None) -> ResultPolicy:
     return RETURN_CODE_POLICY.get(code, "UNKNOWN")
 
 
+def _protected_exit_reason(trade: TradeRecord, price: float) -> ExitReason:
+    if trade.side == Side.LONG.value:
+        if price <= trade.stop_loss:
+            return ExitReason.STOP_LOSS
+        if price >= trade.take_profit:
+            return ExitReason.TAKE_PROFIT
+    elif trade.side == Side.SHORT.value:
+        if price >= trade.stop_loss:
+            return ExitReason.STOP_LOSS
+        if price <= trade.take_profit:
+            return ExitReason.TAKE_PROFIT
+    return ExitReason.UNKNOWN
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionResult:
     intent: IntentRecord
@@ -502,13 +516,14 @@ class Executor:
                 None,
             )
             if close_deal is not None:
+                close_reason = _protected_exit_reason(trade, close_deal.price)
                 self._store.close_trade(
                     ticket,
                     close_deal.time_utc.isoformat(),
                     close_deal.price,
                     close_deal.profit,
                     close_deal.commission,
-                    ExitReason.UNKNOWN,
+                    close_reason,
                 )
                 actions.append(f"closed-in-store:{ticket}")
         return ReconcileReport(tuple(actions))
