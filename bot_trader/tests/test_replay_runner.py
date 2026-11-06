@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import csv
 import json
+from dataclasses import fields
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,7 +23,10 @@ from bot.app.replay_runner import (
 from bot.core.indicators import ema
 from bot.core.replay import ReplaySettings
 from bot.core.risk import RiskLimits
+from bot.core.strategy_a import StrategyAParams
+from bot.core.strategy_b import StrategyBParams
 from bot.core.types import Candle, SymbolSpec
+from tools import replay as replay_tool
 
 SPEC = SymbolSpec(
     "EURUSD",
@@ -149,6 +155,8 @@ def test_engine_replay_uses_simulator_and_writes_auditable_report(tmp_path) -> N
         now_utc=start + timedelta(hours=4),
         final=True,
         no_news=True,
+        strategy_mode="a",
+        strategy_a_params=StrategyAParams(ema_fast=16),
         report_root=tmp_path,
         code_version="unit-test-commit",
         settings_version="unit-test-settings",
@@ -169,6 +177,7 @@ def test_engine_replay_uses_simulator_and_writes_auditable_report(tmp_path) -> N
     assert summary["code_version"] == "unit-test-commit"
     assert summary["settings_version"] == "unit-test-settings"
     assert summary["cost_multiplier"] == 2.0
+    assert summary["strategy_parameters"]["A"]["ema_fast"] == 16
 
 
 def test_engine_replay_rejects_recent_history_without_final_flag() -> None:
@@ -195,6 +204,55 @@ def test_engine_replay_rejects_recent_history_without_final_flag() -> None:
             final=False,
             no_news=True,
         )
+
+
+def test_sensitivity_writes_every_parameter_variant_and_records_completed_runs(
+    tmp_path, monkeypatch
+) -> None:
+    calls = []
+
+    def fake_run_replay(*positional_args, **kwargs):
+        assert len(positional_args) == 3
+        calls.append(kwargs)
+        return SimpleNamespace(
+            report_dir=tmp_path / f"report-{len(calls)}",
+            ending_equity=3_000.0,
+            deals=(),
+        )
+
+    monkeypatch.setattr(replay_tool, "run_replay", fake_run_replay)
+    settings = _settings()
+    start = datetime(2024, 10, 26, 8, tzinfo=UTC)
+    result_path = replay_tool._run_sensitivity(
+        ("a", "b"),
+        _histories(start),
+        {"EURUSD": SPEC},
+        settings,
+        now_utc=start + timedelta(hours=4),
+        starting_equity=3_000.0,
+        no_news=True,
+        report_root=tmp_path,
+        code_version="test",
+        settings_version="test",
+        cost_multiplier=1.0,
+    )
+
+    with result_path.open(newline="", encoding="utf-8") as file:
+        rows = list(csv.DictReader(file))
+    expected_count = 2 * (
+        len(fields(StrategyAParams)) + len(fields(StrategyBParams))
+    )
+    assert len(rows) == expected_count
+    assert len(calls) + sum(row["status"] == "INVALID" for row in rows) == expected_count
+    assert {kwargs["strategy_mode"] for kwargs in calls} == {"a", "b"}
+    assert all(
+        (kwargs.get("strategy_a_params") is None)
+        != (kwargs.get("strategy_b_params") is None)
+        for kwargs in calls
+    )
+    ledger = json.loads((tmp_path / "variants.json").read_text(encoding="utf-8"))
+    assert len(ledger["variants"]) == len(calls)
+    assert {row["status"] for row in rows} <= {"COMPLETED", "INVALID"}
 
 
 def _parity_fixture(start: datetime, count: int) -> tuple[Candle, ...]:
@@ -239,7 +297,9 @@ def _parity_fixture(start: datetime, count: int) -> tuple[Candle, ...]:
     return tuple(candles)
 
 
-def test_engine_replay_strategy_a_matches_legacy_fixture_at_95_percent() -> None:
+def test_engine_replay_strategy_a_matches_legacy_fixture_at_95_percent(
+    tmp_path,
+) -> None:
     settings = _settings()
     start = datetime(2026, 1, 1, 0, tzinfo=UTC)
     h1 = _parity_fixture(start, 650)
@@ -275,6 +335,7 @@ def test_engine_replay_strategy_a_matches_legacy_fixture_at_95_percent() -> None
         final=True,
         no_news=True,
         strategy_mode="a",
+        report_root=tmp_path,
     )
     symbol_settings = settings.symbols["EURUSD"]
     legacy = run_strategy_a_backtest(
@@ -337,3 +398,13 @@ def test_engine_replay_strategy_a_matches_legacy_fixture_at_95_percent() -> None
         f"Strategy A replay parity was {parity_pct:.1f}% "
         f"({matched_trades}/{max(legacy_trades, replay_trades)} trades)"
     )
+    assert replay.report_dir is not None
+    with (replay.report_dir / "trades.csv").open(newline="", encoding="utf-8") as file:
+        trade_rows = list(csv.DictReader(file))
+    with (replay.report_dir / "portfolio_breakdown.csv").open(
+        newline="", encoding="utf-8"
+    ) as file:
+        breakdown_rows = list(csv.DictReader(file))
+    assert trade_rows
+    assert all(row["strategy"] == "A" and row["timeframe"] == "H1" for row in trade_rows)
+    assert any(row["grouping"] == "combined_A+B" for row in breakdown_rows)

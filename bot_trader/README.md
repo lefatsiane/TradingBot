@@ -231,8 +231,28 @@ otherwise it remains `INCONCLUSIVE` rather than assigning a misleading
 percentage.
 
 The scorecard leaves missing cost-stress, parity, and restart evidence
-`INCONCLUSIVE`. Random-entry controls, per-instrument/timeframe reports,
-variant counting, and sensitivity analysis remain unimplemented.
+`INCONCLUSIVE`. Run parameter sensitivity on both strategies with:
+
+```powershell
+python tools/replay.py --settings settings.toml --strategy both --no-news --sensitivity
+```
+
+This writes one replay report per valid +/-20 percent parameter variant, a
+`sensitivity-*.csv` index, and records completed variants in
+`data/reports/variants.json`. Invalid parameter combinations are listed rather
+than silently skipped. The engine's 1,000-candle input cap still applies.
+Random-entry controls remain unimplemented. Replay `portfolio_breakdown.csv` reports strategy,
+symbol/timeframe, and overall combined totals.
+
+Record a unique strategy variant before running it so the attempt count stays
+auditable:
+
+```powershell
+python tools/stats.py --record-variant "strategy-a-ema-fast-24" --variant-description "Strategy A ema_fast=24"
+```
+
+The ledger is `data/reports/variants.json`; reusing a variant identifier is
+rejected.
 
 ## Run tests
 

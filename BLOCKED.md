@@ -45,10 +45,12 @@
 - Simulator failure cases are covered across focused tests. Manual restart, connectivity, phone,
   heartbeat/email, and demo-trade drills remain owner tasks.
 - `tools/stats.py` computes candle-close drawdown, 10,000-resample calendar-week confidence
-  intervals, doubled-cost stress comparisons, and a date/versioned scorecard. The `--final` replay
-  lock is exclusive and records the code version. Random-entry controls,
-  per-instrument/timeframe statistics, variant counting, and parameter sensitivity are not
-  implemented; absent scorecard evidence is `INCONCLUSIVE`.
+  intervals, doubled-cost stress comparisons, and a date/versioned scorecard. Replay reports
+  contain instrument/timeframe and combined A+B trade totals. The `--final` replay lock is exclusive
+  and records the code version. The variant ledger records unique trial IDs. Random-entry controls
+  are not implemented. `tools/replay.py --sensitivity` now runs +/-20 percent numeric-parameter
+  variants and records result indexes, but acceptance runs remain blocked until the owner applies
+  reviewed schedules and supplies validated caches. Absent scorecard evidence is `INCONCLUSIVE`.
 
 ## Git workflow
 

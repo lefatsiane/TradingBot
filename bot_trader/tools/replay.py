@@ -1,18 +1,30 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
+from collections.abc import Mapping
+from dataclasses import fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
+from uuid import uuid4
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from bot.app.config import load_settings
-from bot.app.data import DataQualityError, Timeframe, read_history_cache
-from bot.app.replay_runner import claim_final_holdout_lock, run_replay
+from bot.adapters.broker import SymbolSpec
+from bot.app.config import Settings, load_settings
+from bot.app.data import Candle, DataQualityError, Timeframe, read_history_cache
+from bot.app.replay_runner import (
+    claim_final_holdout_lock,
+    run_replay,
+)
 from bot.app.versioning import get_version
+from bot.core.strategy_a import StrategyAParams
+from bot.core.strategy_b import StrategyBParams
+from tools.stats import record_variant
 
 
 def main() -> None:
@@ -44,6 +56,11 @@ def main() -> None:
         type=float,
         default=1.0,
         help="Scale replay spreads and slippage; use 2.0 for doubled-cost stress.",
+    )
+    parser.add_argument(
+        "--sensitivity",
+        action="store_true",
+        help="Rerun selected strategies with each numeric parameter varied by about 20 percent.",
     )
     args = parser.parse_args()
 
@@ -90,6 +107,27 @@ def main() -> None:
     try:
         version = get_version(PROJECT_ROOT)
         code_version = version.commit + ("-dirty" if not version.clean else "")
+        if args.sensitivity:
+            if args.final:
+                parser.error("--sensitivity cannot be combined with --final")
+            strategies = (
+                ("a", "b") if args.strategy == "both" else (args.strategy,)
+            )
+            sensitivity_path = _run_sensitivity(
+                strategies,
+                histories,
+                specs,
+                settings,
+                now_utc=now,
+                starting_equity=args.starting_equity,
+                no_news=args.no_news,
+                report_root=reports_dir,
+                code_version=code_version,
+                settings_version=settings_version,
+                cost_multiplier=args.cost_multiplier,
+            )
+            print(f"Saved sensitivity results: {sensitivity_path}")
+            return
         if args.final:
             claim_final_holdout_lock(
                 reports_dir / "final-holdout.lock",
@@ -124,6 +162,151 @@ def main() -> None:
         f"excluded_recent_bars={result.excluded_recent_bars}"
     )
     print(f"Saved replay report: {result.report_dir}")
+
+
+def _run_sensitivity(
+    strategies: tuple[Literal["a", "b"], ...],
+    histories: Mapping[tuple[str, Timeframe], tuple[Candle, ...]],
+    specs: Mapping[str, SymbolSpec],
+    settings: Settings,
+    *,
+    now_utc: datetime,
+    starting_equity: float,
+    no_news: bool,
+    report_root: Path,
+    code_version: str,
+    settings_version: str,
+    cost_multiplier: float,
+) -> Path:
+    rows: list[dict[str, object]] = []
+    for strategy in strategies:
+        if strategy == "a":
+            base_params = settings.strategy_a.to_params()
+            parameter_type = StrategyAParams
+        else:
+            base_params = settings.strategy_b.to_params()
+            parameter_type = StrategyBParams
+        for parameter in fields(parameter_type):
+            original_value = getattr(base_params, parameter.name)
+            if isinstance(original_value, bool) or not isinstance(
+                original_value, (int, float)
+            ):
+                continue
+            for direction, multiplier in (("minus20", 0.8), ("plus20", 1.2)):
+                variant_value = (
+                    max(1, round(original_value * multiplier))
+                    if isinstance(original_value, int)
+                    else original_value * multiplier
+                )
+                variant_id = (
+                    f"sensitivity-{strategy}-{parameter.name}-{direction}-"
+                    f"{uuid4().hex[:12]}"
+                )
+                description = (
+                    f"Strategy {strategy.upper()} {parameter.name}: "
+                    f"{original_value} -> {variant_value} ({direction})"
+                )
+                try:
+                    candidate = replace(
+                        base_params,
+                        **{parameter.name: variant_value},
+                    )
+                except ValueError as error:
+                    rows.append(
+                        {
+                            "strategy": strategy.upper(),
+                            "parameter": parameter.name,
+                            "baseline_value": original_value,
+                            "variant_value": variant_value,
+                            "status": "INVALID",
+                            "report_dir": "",
+                            "ending_equity": "",
+                            "closed_trades": "",
+                            "details": str(error),
+                        }
+                    )
+                    continue
+                if isinstance(candidate, StrategyAParams):
+                    result = run_replay(
+                        histories,
+                        specs,
+                        settings,
+                        now_utc=now_utc,
+                        starting_equity=starting_equity,
+                        no_news=no_news,
+                        strategy_mode="a",
+                        report_root=report_root,
+                        code_version=code_version,
+                        settings_version=settings_version,
+                        cost_multiplier=cost_multiplier,
+                        strategy_a_params=candidate,
+                    )
+                else:
+                    result = run_replay(
+                        histories,
+                        specs,
+                        settings,
+                        now_utc=now_utc,
+                        starting_equity=starting_equity,
+                        no_news=no_news,
+                        strategy_mode="b",
+                        report_root=report_root,
+                        code_version=code_version,
+                        settings_version=settings_version,
+                        cost_multiplier=cost_multiplier,
+                        strategy_b_params=candidate,
+                    )
+                record_variant(
+                    report_root / "variants.json",
+                    variant_id,
+                    description,
+                    recorded_at_utc=now_utc,
+                )
+                rows.append(
+                    {
+                        "strategy": strategy.upper(),
+                        "parameter": parameter.name,
+                        "baseline_value": original_value,
+                        "variant_value": variant_value,
+                        "status": "COMPLETED",
+                        "report_dir": result.report_dir or "",
+                        "ending_equity": result.ending_equity,
+                        "closed_trades": sum(
+                            deal.is_entry is False for deal in result.deals
+                        ),
+                        "details": (
+                            f"{description}; parameter is subject to the "
+                            "1,000-candle engine cap"
+                            if parameter.name == "window_candles"
+                            and variant_value > 1_000
+                            else description
+                        ),
+                    }
+                )
+
+    report_root.mkdir(parents=True, exist_ok=True)
+    destination = (
+        report_root
+        / f"sensitivity-{now_utc:%Y%m%dT%H%M%SZ}-{uuid4().hex[:8]}.csv"
+    )
+    with destination.open("x", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=(
+                "strategy",
+                "parameter",
+                "baseline_value",
+                "variant_value",
+                "status",
+                "report_dir",
+                "ending_equity",
+                "closed_trades",
+                "details",
+            ),
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    return destination
 
 
 if __name__ == "__main__":

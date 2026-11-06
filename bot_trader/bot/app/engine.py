@@ -33,7 +33,9 @@ from bot.core.risk import (
     evaluate_loss_limits,
 )
 from bot.core.sizing import SizeResult, size_trade
+from bot.core.strategy_a import StrategyAParams
 from bot.core.strategy_a import propose as propose_a
+from bot.core.strategy_b import StrategyBParams
 from bot.core.strategy_b import propose as propose_b
 from bot.core.timeutil import (
     month_start_utc,
@@ -96,6 +98,8 @@ class EntryContext:
     news_events: tuple[NewsEvent, ...] = ()
     news_calendar_valid: bool = True
     strategy_mode: Literal["a", "b", "both"] = "both"
+    strategy_a_params: StrategyAParams | None = None
+    strategy_b_params: StrategyBParams | None = None
     stop_new: bool = False
     halted_daily: bool = False
     halted_monthly: bool = False
@@ -164,7 +168,13 @@ def evaluate_candle(context: EntryContext) -> Decision:
     ):
         return _decision(context, at_utc, ReasonCode.NEWS_WINDOW)
 
-    atr_values = atr(context.candles, context.settings.strategy_a.atr_period)
+    if context.strategy_mode == "a" and context.strategy_a_params is not None:
+        atr_period = context.strategy_a_params.atr_period
+    elif context.strategy_mode == "b" and context.strategy_b_params is not None:
+        atr_period = context.strategy_b_params.atr_period
+    else:
+        atr_period = context.settings.strategy_a.atr_period
+    atr_values = atr(context.candles, atr_period)
     current_atr = atr_values[-1] if atr_values else 0.0
     current_candle = context.candles[-1]
     full_gate = _gate(
@@ -186,7 +196,7 @@ def evaluate_candle(context: EntryContext) -> Decision:
         positions=context.open_risks,
         pending=context.pending_risks,
         bars_since_stop=context.bars_since_stop,
-        limits=_risk_limits(context.settings),
+        limits=_entry_risk_limits(context),
     )
     if slot_reason is not None:
         return _decision(context, at_utc, slot_reason)
@@ -233,7 +243,7 @@ def evaluate_candle(context: EntryContext) -> Decision:
         start_of_day_equity=context.start_of_day_equity,
         margin_used_after_pct=context.margin_used_after_pct,
         bars_since_stop=context.bars_since_stop,
-        limits=_risk_limits(context.settings),
+        limits=_entry_risk_limits(context),
     )
     if not risk.allowed:
         return _decision(
@@ -301,9 +311,11 @@ def _gate(
 
 
 def _propose(context: EntryContext) -> tuple[str, StrategyResult]:
+    params_a = context.strategy_a_params or context.settings.strategy_a.to_params()
+    params_b = context.strategy_b_params or context.settings.strategy_b.to_params()
     if context.strategy_mode == "a":
         if context.timeframe in context.settings.strategy_a.timeframes:
-            return "A", propose_a(context.candles, context.settings.strategy_a.to_params())
+            return "A", propose_a(context.candles, params_a)
         return "A", StrategyResult(None, ReasonCode.WARMUP)
     if context.strategy_mode == "b":
         if context.timeframe == "H1":
@@ -311,18 +323,18 @@ def _propose(context: EntryContext) -> tuple[str, StrategyResult]:
                 "B",
                 propose_b(
                     context.candles,
-                    context.settings.strategy_b.to_params(),
+                    params_b,
                     timeframe=context.timeframe,
                 ),
             )
         return "B", StrategyResult(None, ReasonCode.WARMUP)
     if context.timeframe in context.settings.strategy_a.timeframes:
-        result_a = propose_a(context.candles, context.settings.strategy_a.to_params())
+        result_a = propose_a(context.candles, params_a)
         if result_a.proposal is not None or context.timeframe != "H1":
             return "A", result_a
         result_b = propose_b(
             context.candles,
-            context.settings.strategy_b.to_params(),
+            params_b,
             timeframe=context.timeframe,
         )
         if result_b.proposal is not None:
@@ -333,7 +345,7 @@ def _propose(context: EntryContext) -> tuple[str, StrategyResult]:
             "B",
             propose_b(
                 context.candles,
-                context.settings.strategy_b.to_params(),
+                params_b,
                 timeframe=context.timeframe,
             ),
         )
@@ -369,6 +381,27 @@ def _risk_limits(settings: Settings) -> RiskLimits:
         max_open_trades=settings.risk.max_open_trades,
         max_margin_used_pct=settings.risk.max_margin_used_pct,
         cooldown_bars_after_stop=settings.risk.cooldown_bars_after_stop,
+    )
+
+
+def _entry_risk_limits(context: EntryContext) -> RiskLimits:
+    if context.strategy_mode == "a":
+        cooldown = (
+            context.strategy_a_params.cooldown_bars_after_stop
+            if context.strategy_a_params is not None
+            else context.settings.strategy_a.cooldown_bars_after_stop
+        )
+    elif context.strategy_mode == "b":
+        cooldown = (
+            context.strategy_b_params.cooldown_bars_after_stop
+            if context.strategy_b_params is not None
+            else context.settings.strategy_b.cooldown_bars_after_stop
+        )
+    else:
+        cooldown = context.settings.risk.cooldown_bars_after_stop
+    return replace(
+        _risk_limits(context.settings),
+        cooldown_bars_after_stop=cooldown,
     )
 
 
@@ -431,6 +464,8 @@ class Engine:
         settings_version: str,
         news_enabled: bool = True,
         strategy_mode: Literal["a", "b", "both"] = "both",
+        strategy_a_params: StrategyAParams | None = None,
+        strategy_b_params: StrategyBParams | None = None,
     ) -> None:
         if strategy_mode not in ("a", "b", "both"):
             raise ValueError("strategy_mode must be 'a', 'b', or 'both'")
@@ -444,6 +479,8 @@ class Engine:
         self._settings_version = settings_version
         self._news_enabled = news_enabled
         self._strategy_mode = strategy_mode
+        self._strategy_a_params = strategy_a_params
+        self._strategy_b_params = strategy_b_params
         self._news_events: tuple[NewsEvent, ...] = ()
         self._news_calendar_valid: bool | None = None
         self._instance_lock_file: BinaryIO | None = None
@@ -492,7 +529,14 @@ class Engine:
                     self._store.set_meta(
                         f"entry_data_error_alerted:{symbol}:{timeframe}", "0"
                     )
-                    window = closed[-1_000:]
+                    window_limit = (
+                        self._strategy_a_params.window_candles
+                        if self._strategy_mode == "a" and self._strategy_a_params is not None
+                        else self._strategy_b_params.window_candles
+                        if self._strategy_mode == "b" and self._strategy_b_params is not None
+                        else 1_000
+                    )
+                    window = closed[-min(window_limit, 1_000):]
                     newest = window[-1]
                     progress = self._store.get_bar_progress(symbol, timeframe)
                     if progress is not None and newest.time.isoformat() <= progress:
@@ -519,6 +563,8 @@ class Engine:
                             else context.news_calendar_valid
                         ),
                         strategy_mode=self._strategy_mode,
+                        strategy_a_params=self._strategy_a_params,
+                        strategy_b_params=self._strategy_b_params,
                         bars_since_stop=self._bars_since_stop(
                             symbol, timeframe, window
                         ),
@@ -1111,7 +1157,11 @@ class Engine:
                 opened_at = datetime.fromisoformat(trade.opened_at_utc)
                 if (
                     sum(candle.time > opened_at for candle in closed)
-                    >= self._settings.strategy_b.time_stop_candles
+                    >= (
+                        self._strategy_b_params.time_stop_candles
+                        if self._strategy_b_params is not None
+                        else self._settings.strategy_b.time_stop_candles
+                    )
                     and self._executor.close_position(trade.ticket, ExitReason.TIME_STOP)
                 ):
                     actions.append(f"time-stop:{trade.ticket}")

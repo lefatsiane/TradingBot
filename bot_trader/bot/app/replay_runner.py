@@ -6,7 +6,7 @@ import os
 import tempfile
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from math import isfinite
 from pathlib import Path
@@ -16,7 +16,7 @@ from uuid import uuid4
 from bot.adapters.broker import BrokerAccount, BrokerDeal, Tick
 from bot.adapters.gateway import BrokerGateway
 from bot.adapters.sim_broker import SimBroker, SimCosts
-from bot.adapters.store import StateStore
+from bot.adapters.store import StateStore, TradeRecord
 from bot.app.backtest import EquityPoint, select_backtest_history
 from bot.app.config import (
     Settings,
@@ -27,6 +27,8 @@ from bot.app.data import DataQualityError, Timeframe
 from bot.app.engine import Engine
 from bot.app.executor import Executor
 from bot.core.clock import SimClock
+from bot.core.strategy_a import StrategyAParams
+from bot.core.strategy_b import StrategyBParams
 from bot.core.timeutil import expected_new_york_offset
 from bot.core.types import Candle, Decision, SymbolSpec
 
@@ -38,6 +40,7 @@ DEFAULT_STARTING_EQUITY = 3_000.0
 @dataclass(frozen=True, slots=True)
 class ReplayRunResult:
     strategy_mode: StrategyMode
+    strategy_parameters: dict[str, dict[str, int | float]]
     starting_equity: float
     ending_equity: float
     cost_multiplier: float
@@ -45,6 +48,7 @@ class ReplayRunResult:
     settings_version: str
     decisions: tuple[Decision, ...]
     deals: tuple[BrokerDeal, ...]
+    trades: tuple[TradeRecord, ...]
     equity_curve: tuple[EquityPoint, ...]
     open_positions: tuple[dict[str, object], ...]
     excluded_recent_bars: int
@@ -68,11 +72,17 @@ def run_replay(
     code_version: str = "replay",
     settings_version: str = "replay",
     cost_multiplier: float = 1.0,
+    strategy_a_params: StrategyAParams | None = None,
+    strategy_b_params: StrategyBParams | None = None,
 ) -> ReplayRunResult:
     """Replay cached candles through the production Engine, Executor and SimBroker."""
     now = _require_utc(now_utc, "now_utc")
     if strategy_mode not in ("a", "b", "both"):
         raise ValueError("strategy_mode must be 'a', 'b', or 'both'")
+    if strategy_a_params is not None and strategy_mode != "a":
+        raise ValueError("Strategy A parameter overrides require strategy_mode='a'")
+    if strategy_b_params is not None and strategy_mode != "b":
+        raise ValueError("Strategy B parameter overrides require strategy_mode='b'")
     if settings.account.mode != "demo" or settings.account.allow_live:
         raise ValueError("Replay requires demo-only settings with live trading disabled")
     if starting_equity <= 0 or not isfinite(starting_equity):
@@ -181,6 +191,8 @@ def run_replay(
         settings_version=settings_version,
         news_enabled=not no_news,
         strategy_mode=strategy_mode,
+        strategy_a_params=strategy_a_params,
+        strategy_b_params=strategy_b_params,
     )
 
     decisions: list[Decision] = []
@@ -221,6 +233,7 @@ def run_replay(
 
         final_account = broker.account()
         deals = broker.history_deals(first_time, settings.account.magic_number)
+        trades = store.trades()
         positions = broker.positions(settings.account.magic_number)
         open_positions = tuple(
             {
@@ -237,6 +250,18 @@ def run_replay(
         )
         result = ReplayRunResult(
             strategy_mode=strategy_mode,
+            strategy_parameters={
+                "A": asdict(strategy_a_params or settings.strategy_a.to_params())
+            }
+            if strategy_mode == "a"
+            else {
+                "B": asdict(strategy_b_params or settings.strategy_b.to_params())
+            }
+            if strategy_mode == "b"
+            else {
+                "A": asdict(settings.strategy_a.to_params()),
+                "B": asdict(settings.strategy_b.to_params()),
+            },
             starting_equity=starting_equity,
             ending_equity=final_account.equity,
             cost_multiplier=cost_multiplier,
@@ -244,6 +269,7 @@ def run_replay(
             settings_version=settings_version,
             decisions=tuple(decisions),
             deals=deals,
+            trades=trades,
             equity_curve=tuple(equity_curve),
             open_positions=open_positions,
             excluded_recent_bars=excluded_recent_bars,
@@ -276,12 +302,15 @@ def write_replay_report(
     deals_by_position: dict[str, list[BrokerDeal]] = defaultdict(list)
     for deal in result.deals:
         deals_by_position[deal.position_ticket].append(deal)
+    trade_by_ticket = {trade.ticket: trade for trade in result.trades}
 
     _write_csv(
         run_dir / "trades.csv",
         (
             "ticket",
             "symbol",
+            "strategy",
+            "timeframe",
             "side",
             "lots",
             "entry_time_utc",
@@ -293,9 +322,22 @@ def write_replay_report(
             "open",
         ),
         (
-            _trade_row(ticket, items)
+            _trade_row(ticket, items, trade_by_ticket.get(ticket))
             for ticket, items in sorted(deals_by_position.items())
         ),
+    )
+    _write_csv(
+        run_dir / "portfolio_breakdown.csv",
+        (
+            "grouping",
+            "instrument",
+            "timeframe",
+            "trade_count",
+            "closed_trades",
+            "open_trades",
+            "net_profit",
+        ),
+        _portfolio_breakdown(result, deals_by_position),
     )
     _write_csv(
         run_dir / "decisions.csv",
@@ -314,6 +356,7 @@ def write_replay_report(
         "schema_version": 1,
         "created_at_utc": created.isoformat(),
         "strategy": result.strategy_mode,
+        "strategy_parameters": result.strategy_parameters,
         "news_enabled": result.news_enabled,
         "final_run": result.final_run,
         "cost_multiplier": result.cost_multiplier,
@@ -420,13 +463,19 @@ def _candle_at(candles: tuple[Candle, ...], at_utc: datetime) -> Candle | None:
     return next((candle for candle in candles if candle.time == at_utc), None)
 
 
-def _trade_row(ticket: str, deals: list[BrokerDeal]) -> dict[str, object]:
+def _trade_row(
+    ticket: str,
+    deals: list[BrokerDeal],
+    trade: TradeRecord | None,
+) -> dict[str, object]:
     entry = next((deal for deal in deals if deal.is_entry is True), None)
     exit_deal = next((deal for deal in reversed(deals) if deal.is_entry is False), None)
     reference = entry or deals[0]
     return {
         "ticket": ticket,
         "symbol": reference.symbol,
+        "strategy": trade.strategy if trade is not None else "",
+        "timeframe": trade.timeframe if trade is not None else "",
         "side": reference.side.value if entry is not None else "",
         "lots": reference.lots,
         "entry_time_utc": entry.time_utc.isoformat() if entry else "",
@@ -437,6 +486,48 @@ def _trade_row(ticket: str, deals: list[BrokerDeal]) -> dict[str, object]:
         "commission": sum(deal.commission for deal in deals),
         "open": exit_deal is None,
     }
+
+
+def _portfolio_breakdown(
+    result: ReplayRunResult,
+    deals_by_position: Mapping[str, list[BrokerDeal]],
+) -> Iterable[dict[str, object]]:
+    trades_by_bucket: dict[tuple[str, str, str], list[TradeRecord]] = defaultdict(list)
+    for trade in result.trades:
+        trades_by_bucket[(trade.symbol, trade.timeframe, trade.strategy)].append(trade)
+
+    def row(
+        grouping: str,
+        instrument: str,
+        timeframe: str,
+        bucket_trades: list[TradeRecord],
+    ) -> dict[str, object]:
+        profit = 0.0
+        closed_count = 0
+        open_count = 0
+        for trade in bucket_trades:
+            deals = deals_by_position.get(trade.ticket, [])
+            is_closed = any(deal.is_entry is False for deal in deals)
+            if is_closed:
+                closed_count += 1
+                profit += sum(deal.profit - deal.commission for deal in deals)
+            else:
+                open_count += 1
+        return {
+            "grouping": grouping,
+            "instrument": instrument,
+            "timeframe": timeframe,
+            "trade_count": len(bucket_trades),
+            "closed_trades": closed_count,
+            "open_trades": open_count,
+            "net_profit": profit,
+        }
+
+    for (symbol, timeframe, strategy), trades in sorted(trades_by_bucket.items()):
+        yield row("strategy", symbol, f"{timeframe}:{strategy}", trades)
+        yield row("instrument_timeframe", symbol, timeframe, trades)
+    if result.trades:
+        yield row("combined_A+B", "ALL", "ALL", list(result.trades))
 
 
 def _decision_row(decision: Decision) -> dict[str, object]:

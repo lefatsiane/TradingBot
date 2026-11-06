@@ -374,6 +374,12 @@ class StateStore:
         ).fetchall()
         return tuple(self._trade_from_row(row) for row in rows)
 
+    def trades(self) -> tuple[TradeRecord, ...]:
+        rows = self._connection().execute(
+            "SELECT * FROM trades ORDER BY opened_at_utc, ticket"
+        ).fetchall()
+        return tuple(self._trade_from_row(row) for row in rows)
+
     def get_bar_progress(self, symbol: str, timeframe: str) -> str | None:
         row = self._connection().execute(
             "SELECT last_open_utc FROM bar_progress WHERE symbol = ? AND timeframe = ?",

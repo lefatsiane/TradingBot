@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import random
 import sys
 from collections import defaultdict
@@ -181,6 +182,61 @@ def write_scorecard(
     return destination
 
 
+def record_variant(
+    ledger_path: str | Path,
+    variant_id: str,
+    description: str,
+    *,
+    recorded_at_utc: datetime,
+) -> int:
+    if not variant_id.strip() or not description.strip():
+        raise ValueError("variant_id and description must not be empty")
+    recorded = recorded_at_utc
+    if recorded.tzinfo is None or recorded.utcoffset() is None:
+        raise ValueError("recorded_at_utc must be timezone-aware")
+    recorded = recorded.astimezone(UTC)
+    path = Path(ledger_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            raise ValueError("Variant ledger has an unsupported schema")
+        variants = payload.get("variants")
+        if not isinstance(variants, list) or not all(
+            isinstance(item, dict)
+            and isinstance(item.get("variant_id"), str)
+            and isinstance(item.get("description"), str)
+            and isinstance(item.get("recorded_at_utc"), str)
+            for item in variants
+        ):
+            raise ValueError("Variant ledger has an invalid variants list")
+    else:
+        variants = []
+    if any(item["variant_id"] == variant_id for item in variants):
+        raise ValueError(f"Variant {variant_id!r} is already recorded")
+    updated = {
+        "schema_version": 1,
+        "variants": [
+            *variants,
+            {
+                "variant_id": variant_id,
+                "description": description,
+                "recorded_at_utc": recorded.isoformat(),
+            },
+        ],
+    }
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        temporary.write_text(
+            json.dumps(updated, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return len(updated["variants"])
+
+
 def _validate_stress_pair(
     baseline: dict[str, Any],
     stress: dict[str, Any],
@@ -320,14 +376,44 @@ def _finite_number(summary: dict[str, Any], key: str) -> float:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Analyze an engine replay report and write its scorecard."
+        description="Analyze a replay report or record a strategy variant."
     )
-    parser.add_argument("report_dir", help="Directory containing summary.json and equity_curve.csv")
+    parser.add_argument(
+        "report_dir",
+        nargs="?",
+        help="Directory containing summary.json and equity_curve.csv.",
+    )
     parser.add_argument(
         "--cost-stress-report",
         help="Matching replay report created with --cost-multiplier 2.",
     )
+    parser.add_argument("--record-variant", help="Unique identifier for a strategy variant tried.")
+    parser.add_argument("--variant-description", help="Parameters/change description for the variant.")
+    parser.add_argument(
+        "--variant-ledger",
+        default="data/reports/variants.json",
+        help="Variant ledger path (default: data/reports/variants.json).",
+    )
     args = parser.parse_args(argv)
+    if args.record_variant is not None:
+        if not args.variant_description:
+            parser.error("--variant-description is required with --record-variant")
+        if args.report_dir is not None or args.cost_stress_report is not None:
+            parser.error("Variant recording cannot be combined with report analysis")
+        try:
+            count = record_variant(
+                args.variant_ledger,
+                args.record_variant,
+                args.variant_description,
+                recorded_at_utc=datetime.now(tz=UTC),
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            print(f"Variant recording failed: {error}", file=sys.stderr)
+            return 2
+        print(f"Recorded strategy variant {args.record_variant}; total variants: {count}")
+        return 0
+    if args.report_dir is None:
+        parser.error("report_dir is required unless --record-variant is used")
     try:
         path = write_scorecard(
             args.report_dir,

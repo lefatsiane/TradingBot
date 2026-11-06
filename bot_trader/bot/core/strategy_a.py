@@ -24,6 +24,7 @@ class StrategyAParams:
     take_profit_r: float = 2.0
     min_candles: int = 600
     window_candles: int = 1_000
+    cooldown_bars_after_stop: int = 6
 
     def __post_init__(self) -> None:
         integer_values = (
@@ -36,6 +37,7 @@ class StrategyAParams:
             self.stop_lookback,
             self.min_candles,
             self.window_candles,
+            self.cooldown_bars_after_stop,
         )
         if any(value < 1 for value in integer_values):
             raise ValueError("Strategy A periods and candle limits must be positive")

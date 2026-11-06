@@ -10,6 +10,7 @@ from tools.stats import (
     analyze_report,
     build_scorecard,
     calculate_statistics,
+    record_variant,
     write_scorecard,
 )
 
@@ -155,3 +156,33 @@ def test_cost_stress_rejects_mismatched_reports(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="differ on strategy"):
         analyze_report(baseline, cost_stress_report=stress)
+
+
+def test_variant_counter_persists_unique_trials_and_rejects_duplicate_ids(
+    tmp_path,
+) -> None:
+    ledger = tmp_path / "reports" / "variants.json"
+    recorded_at = datetime(2026, 11, 6, 15, tzinfo=UTC)
+
+    assert record_variant(
+        ledger,
+        "strategy-a-ema-fast-24",
+        "Strategy A ema_fast=24",
+        recorded_at_utc=recorded_at,
+    ) == 1
+    assert record_variant(
+        ledger,
+        "strategy-b-rsi-oversold-36",
+        "Strategy B rsi_oversold=36",
+        recorded_at_utc=recorded_at,
+    ) == 2
+    with pytest.raises(ValueError, match="already recorded"):
+        record_variant(
+            ledger,
+            "strategy-a-ema-fast-24",
+            "Repeat",
+            recorded_at_utc=recorded_at,
+        )
+
+    stored = json.loads(ledger.read_text(encoding="utf-8"))
+    assert len(stored["variants"]) == 2

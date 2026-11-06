@@ -230,6 +230,7 @@ class StrategyASettings(StrictModel):
             take_profit_r=self.take_profit_r,
             min_candles=self.min_candles,
             window_candles=self.window_candles,
+            cooldown_bars_after_stop=self.cooldown_bars_after_stop,
         )
 
 

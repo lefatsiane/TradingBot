@@ -446,12 +446,15 @@ cross-check first, then sensitivity, then the rest stays.
   one-position rule and exits.
 - [x] Cost stress: rerun with spreads and slippage doubled (`tools/replay.py --cost-multiplier 2`)
   and compare matching reports with `tools/stats.py --cost-stress-report`.
-- [ ] Per-instrument, per-timeframe and combined A+B reports.
+- [x] Per-instrument, per-timeframe and combined A+B reports (`portfolio_breakdown.csv` records
+  symbol/timeframe strategy groups, instrument-timeframe totals, and the overall combined total).
 - [x] Holdout lock: the last 12 months load only with `--final`, and the run writes a lock file holding
   the code version so it can be run once.
-- [ ] Variant counter: record how many strategy variants were tried.
+- [x] Variant counter: record unique tried variants in the persistent JSON ledger, rejecting duplicate
+  IDs.
 - [ ] Sensitivity check: rerun each strategy with each fixed value moved about 20% (construct
-  `StrategyAParams` / `StrategyBParams` directly).
+  `StrategyAParams` / `StrategyBParams` directly); a `--sensitivity` replay mode now produces
+  per-variant reports and an index, but acceptance runs still require reviewed schedules and caches.
 - [x] **Scorecard** file: each available measure, value, interval, threshold, and PASS / FAIL /
   INCONCLUSIVE, plus date ranges and versions. Missing cost-drift, parity, and restart evidence is
   explicitly INCONCLUSIVE; thresholds are taken from the task/design record, not invented.
@@ -459,9 +462,13 @@ cross-check first, then sensitivity, then the rest stays.
 **Progress note:** `tools/stats.py` writes candle-close drawdown metrics, calendar-week bootstrap
 confidence intervals, and a versioned/date-ranged scorecard. The replay cost multiplier supports
 doubled spreads and slippage; the scorecard compares only matching baseline/stress reports. The
-one-time `--final` lock is exclusive and records the code version. Random-entry controls,
-per-instrument/timeframe reports, variant counting, and parameter sensitivity remain open and must
-not be inferred from the current scorecard.
+one-time `--final` lock is exclusive and records the code version. Replay reports now include trade
+attribution and per-instrument/timeframe plus combined A+B totals. Variant trials can be recorded in
+`data/reports/variants.json`. `tools/replay.py --sensitivity` now varies each numeric A/B strategy
+parameter by about +/-20%, passes the parameter objects directly into the engine-backed replay,
+writes variant summaries, and records completed runs. The sensitivity acceptance runs remain open
+until run against reviewed schedules and validated caches. Random-entry controls remain open and
+must not be inferred from the current scorecard.
 
 ---
 
