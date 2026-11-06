@@ -24,6 +24,24 @@ def test_news_calendar_is_sorted_and_has_enough_future_coverage(tmp_path) -> Non
     assert [event.currency for event in events] == ["USD", "EUR", "GBP"]
 
 
+def test_calendar_rejects_unsorted_source_rows(tmp_path) -> None:
+    now = datetime(2026, 11, 1, tzinfo=UTC)
+    calendar_path = tmp_path / "unsorted-news.csv"
+    calendar_path.write_text(
+        "time_utc,currency,impact,title\n"
+        f"{(now + timedelta(days=8)).isoformat()},USD,high,Fake later\n"
+        f"{(now + timedelta(days=1)).isoformat()},EUR,high,Fake earlier\n",
+        encoding="utf-8",
+    )
+
+    try:
+        validate_news_calendar(calendar_path, now_utc=now)
+    except ValueError as error:
+        assert "not sorted" in str(error)
+        return
+    raise AssertionError("Calendar source rows out of order should fail validation")
+
+
 def test_calendar_rejects_short_coverage(tmp_path) -> None:
     calendar_path = tmp_path / "news.csv"
     base = datetime.now(UTC).replace(microsecond=0) + timedelta(days=1)

@@ -76,7 +76,7 @@ def load_news_calendar(path: str | Path) -> list[NewsEvent]:
                 continue
             events.append(NewsEvent.from_row(row, row_number=row_number))
 
-    return sorted(events, key=lambda event: event.time_utc)
+    return events
 
 
 def validate_news_calendar(

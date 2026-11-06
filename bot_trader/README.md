@@ -23,8 +23,8 @@ Implemented so far:
 - Standalone fail-closed entry gates for configured sessions, weekend and
   rollover windows, news-calendar freshness/events, spread, and abnormal
   candle range. Calendar validation, startup coverage alerts, and engine
-  fail-closed news integration are implemented; approved broker schedules and
-  production runtime wiring remain open.
+  fail-closed news integration are implemented; approved broker schedules
+  remain an owner prerequisite.
 - A serialized broker gateway with bounded exponential retries for idempotent
   reads/checks only; state-changing order operations are not retried.
 - A broker executor that journals orders before sending, resolves uncertain
@@ -34,21 +34,23 @@ Implemented so far:
 - Engine components for closed-bar entry processing, candle de-duplication,
   startup guards, loss-limit management, Friday flattening, Strategy B's H1
   time stop, heartbeat persistence, and a Windows single-instance lock. These
-  paths are simulator-tested but are not yet wired to a continuously running
-  command.
+  paths are simulator-tested and wired to `bot.main run`.
 - Telegram polling/control primitives, warning/critical alert outbox delivery,
   a stoppable healthcheck pinger, and a SQLite backup utility are implemented
   with fake-session or local-database tests. A simulator-tested crash-loop
-  guard helper is also present. These are not wired into a production process.
+  guard and safe runtime shutdown are also implemented. Runtime delivery and
+  restart recovery still require owner demo acceptance.
 - A deterministic, single-symbol candle replay with next-bar fills, spread,
   commission, slippage, conservative stop-first intrabar fills, and Strategy B's
-  candle-count time stop. This remains a provisional first backtest rather than a
-  full live-engine parity verification.
-- A Strategy A backtest runner that uses closed candles, `SimBroker`, configured
-  sizing/cost assumptions, and daily/monthly risk checks; it excludes the latest
-  12 months unless `--final` is supplied. The report writer saves trades, the
-  equity curve, and metrics as CSV/JSON. This is single-symbol and not live-engine
-  parity.
+  candle-count time stop. The original Strategy A-only backtest remains available
+  for its fixed-fixture parity comparison.
+- An engine-backed multi-symbol replay runner that feeds cached H1/H4 candles
+  through `Engine`, `Executor`, and `SimBroker`, with session/rollover/news gates,
+  daily/monthly limits, stop-first fills, and auditable CSV/JSON output. It
+  excludes the latest 12 months unless `--final` is supplied. Its fixed Strategy A
+  fixture matches the legacy runner's entry side, time, and price at 100%;
+  reviewed UTC schedules and complete caches are still required for a useful
+  six-pair replay.
 - A simulated broker with bid/ask entry, estimated margin, configurable per-symbol
   commission/slippage assumptions, candle-triggered protective exits with
   stop-first same-candle handling, and deterministic timeout, lost-response,
@@ -77,15 +79,13 @@ Implemented so far:
 - A simulated/system clock and broker-offset-aware time conversion helpers,
   including broker-server day/month boundaries.
 
-Still not implemented or enabled: production runtime wiring/loop, the full
-replayed-week acceptance test, orchestration of the complete fault-injection
-drills, multi-symbol portfolio replay/statistics, Telegram/healthcheck
-runtime delivery, and demo smoke/failure drills. The engine components are
-callable and simulator-tested, but `bot.main` does not connect `MT5Broker`
-to them; real-demo verification remains blocked, and the backtest is
-single-symbol, provisional, and not a complete parity verdict. The
-`bot.main` validation command does not connect to MT5 or place orders. This
-project must not be used for live trading.
+Still pending: a full replayed-week acceptance, portfolio statistics, automated
+failure-drill orchestration, real-demo smoke/restart/control verification, and
+Task Scheduler/laptop verification. The `run` command connects only to a
+configured demo account and refuses invalid or missing enabled-symbol schedules;
+it has not been run against a real terminal and is not approved for unattended
+operation. The separate `validate` command never connects to MT5 or places
+orders. This project must not be used for live trading.
 
 Strategy A uses a 600-candle warm-up. The 1 November 2026 H1 EURUSD checkpoint
 ran to completion and saved its report: 401 trades, net profit -$226.86, win
@@ -106,8 +106,7 @@ entries when it is stale or invalid, alerts once on stale data, and warns below
 against a real economic calendar; they are not certified by these tests.
 
 Operational procedures are tracked in [docs/runbook.md](docs/runbook.md) and
-[docs/drills.md](docs/drills.md); both explicitly remain pending runtime and
-demo acceptance.
+[docs/drills.md](docs/drills.md); manual runtime/demo acceptance remains pending.
 
 ```powershell
 python tools/validate_news.py --settings settings.toml
@@ -134,10 +133,11 @@ The versions recorded for this environment are Python 3.14.7 and MetaTrader5
 5.0.6231. Runtime and development package versions are pinned in the requirement
 files and `pyproject.toml`.
 
-Copy `settings.example.toml` to `settings.toml`, then set the expected demo login
-locally before any future terminal integration. The real settings file is
-git-ignored. Do not add passwords, Telegram tokens, or healthcheck URLs to the
-settings file or source control; read those secrets from environment variables.
+Copy `settings.example.toml` to `settings.toml`. Keep its `expected_login` as
+the placeholder value; provide the demo login and password through
+`MT5_LOGIN` and `MT5_PASSWORD` environment variables only. Do not store an
+account login, password, Telegram token, or healthcheck URL in settings or
+source control. Keep the local settings file git-ignored.
 
 ## Validate configuration
 
@@ -150,9 +150,28 @@ has empty `hours_utc` entries, so validation reports those missing schedules.
 The broker-derived suggestions must be reviewed on the owner's demo terminal
 before applying them. This command never connects to MT5 or places orders.
 
+## Run the demo runtime
+
+The runtime command is implemented but has not been verified against the
+owner's demo terminal. Do not start it until the broker-derived schedules,
+news calendar, demo credentials, and required owner checks are reviewed. It
+refuses missing/invalid enabled-symbol schedules, validates demo account mode,
+and uses a single-instance lock:
+
+```powershell
+python -m bot.main --settings settings.toml run
+```
+
+Runtime credentials are environment-only. Shutdown via Ctrl+C or the supported
+service stop path leaves broker positions open with their protective stops.
+Read [docs/runbook.md](docs/runbook.md) before considering Task Scheduler; its
+installer and Windows settings have not been tested on the owner's laptop.
+
 Retrieve demo-terminal symbol/session data without changing settings:
 
 ```powershell
+$env:MT5_LOGIN = "<demo login>"
+$env:MT5_PASSWORD = "<demo password>"
 python tools/validate_symbols.py --settings settings.toml
 ```
 
@@ -176,15 +195,44 @@ python tools/cache_history.py --settings settings.toml --start-utc 2021-12-02T16
 The cache command validates closed bars and fails on unexplained gaps. The start
 above avoids the currently unresolved EURUSD H1 gap; it also means this dataset
 does not cover six full years. Run a single-symbol Strategy A H1 replay and save
-its trades, equity curve, and summary:
+multi-symbol trades, decisions, equity curve, and summary:
 
 ```powershell
-python tools/replay.py --settings settings.toml --symbol EURUSD --timeframe H1
+python tools/replay.py --settings settings.toml --strategy both --no-news
 ```
 
-By default, the most recent 12 months are excluded. Use `--final` only for the
-final evaluation run. Neither command places live orders, and the saved negative
+Replay requires reviewed `hours_utc` schedules and validated caches for every
+enabled symbol/timeframe. The checked-in template intentionally has empty
+schedules, so the owner must review/apply broker-derived hours before running it.
+News gating stays enabled by default; `--no-news` is explicit and recorded in the
+report. By default, the most recent 12 months are excluded. Use `--final` only
+for the final evaluation run; it creates `data/reports/final-holdout.lock` with
+the code version and prevents a second final run. The replay uses only
+`SimBroker`; it never connects to MT5 or places orders, and the saved negative
 checkpoint result is not a strategy approval.
+
+Analyze a replay report and write its drawdown, 10,000-resample calendar-week
+confidence interval, and scorecard:
+
+```powershell
+python tools/stats.py data/reports/<run-directory>
+```
+
+For doubled spread/slippage stress, rerun the replay with the same settings,
+caches, strategy, and news/final flags, then compare the two report directories:
+
+```powershell
+python tools/replay.py --settings settings.toml --strategy both --no-news --cost-multiplier 2
+python tools/stats.py data/reports/<baseline-run> --cost-stress-report data/reports/<stress-run>
+```
+
+The scorecard computes cost drift only when the baseline net profit is positive;
+otherwise it remains `INCONCLUSIVE` rather than assigning a misleading
+percentage.
+
+The scorecard leaves missing cost-stress, parity, and restart evidence
+`INCONCLUSIVE`. Random-entry controls, per-instrument/timeframe reports,
+variant counting, and sensitivity analysis remain unimplemented.
 
 ## Run tests
 

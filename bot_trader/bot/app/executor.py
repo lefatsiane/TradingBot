@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from math import isfinite
 from typing import Literal
+from uuid import uuid4
 
 from bot.adapters.broker import (
     Broker,
@@ -338,7 +339,9 @@ class Executor:
         if position is None:
             return None
 
-        close_key = f"close-{ticket}-{self._clock.now_utc().timestamp():.6f}"
+        close_key = (
+            f"close-{ticket}-{self._clock.now_utc().timestamp():.6f}-{uuid4().hex}"
+        )
         close_intent = self._store.create_intent(
             intent_key=close_key,
             symbol=position.symbol,

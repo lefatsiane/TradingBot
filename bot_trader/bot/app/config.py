@@ -41,6 +41,7 @@ _APPROVED_RISK_LIMITS = {
 
 
 class AccountSettings(StrictModel):
+    # MT5_LOGIN is the runtime source; this TOML compatibility field is ignored on load.
     expected_login: int = Field(ge=0)
     expected_server: str = Field(min_length=1)
     mode: Literal["demo"] = "demo"
@@ -319,8 +320,14 @@ def load_settings(path: str | Path) -> tuple[Settings, str]:
     with settings_path.open("rb") as settings_file:
         raw = tomllib.load(settings_file)
     settings = Settings.model_validate(raw)
+    settings = settings.model_copy(
+        update={
+            "account": settings.account.model_copy(update={"expected_login": 0})
+        }
+    )
+    canonical_settings = settings.model_dump(mode="json")
     canonical = json.dumps(
-        settings.model_dump(mode="json"),
+        canonical_settings,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -348,6 +355,7 @@ def build_simulator_costs(
 
 @dataclass(frozen=True, slots=True)
 class RuntimeSecrets:
+    mt5_login: int | None
     mt5_password: str | None
     telegram_token: str | None
     healthcheck_url: str | None
@@ -356,7 +364,18 @@ class RuntimeSecrets:
 def load_runtime_secrets(environ: Mapping[str, str] | None = None) -> RuntimeSecrets:
     """Read optional credentials from environment variables, never from TOML."""
     variables = os.environ if environ is None else environ
+    raw_login = variables.get("MT5_LOGIN")
+    if raw_login:
+        try:
+            mt5_login = int(raw_login)
+        except ValueError as error:
+            raise ValueError("MT5_LOGIN must be a positive integer") from error
+        if mt5_login <= 0:
+            raise ValueError("MT5_LOGIN must be a positive integer")
+    else:
+        mt5_login = None
     return RuntimeSecrets(
+        mt5_login=mt5_login,
         mt5_password=variables.get("MT5_PASSWORD") or None,
         telegram_token=variables.get("TELEGRAM_TOKEN") or None,
         healthcheck_url=variables.get("HEALTHCHECK_URL") or None,

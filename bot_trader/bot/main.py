@@ -4,17 +4,26 @@ import argparse
 import sys
 
 from bot.app.config import load_settings, schedule_validation_failures
+from bot.app.runtime import run_bot
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Trading bot development utilities")
+    parser = argparse.ArgumentParser(description="Demo-only Trading Bot commands")
     parser.add_argument("--settings", default="settings.toml")
     parser.add_argument(
         "command",
-        choices=("validate",),
-        help="validate configuration only; this baseline does not connect to MT5 or place orders",
+        choices=("validate", "run"),
+        help="validate configuration, or run the demo-only broker engine",
     )
     args = parser.parse_args()
+    if args.command == "run":
+        try:
+            run_bot(args.settings)
+        except (OSError, PermissionError, RuntimeError, ValueError) as error:
+            print(f"Runtime error: {error}", file=sys.stderr)
+            return 2
+        return 0
+
     try:
         settings, version = load_settings(args.settings)
     except (OSError, ValueError) as error:

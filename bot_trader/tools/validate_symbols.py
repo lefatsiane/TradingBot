@@ -10,7 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from bot.adapters.mt5_broker import MT5Broker
-from bot.app.config import load_settings
+from bot.app.config import load_runtime_secrets, load_settings
 from bot.app.symbol_validation import SymbolValidationReport, validate_symbol, write_hours_utc
 
 
@@ -35,16 +35,19 @@ def main(argv: list[str] | None = None) -> int:
     broker = MT5Broker()
     connected = False
     try:
+        secrets = load_runtime_secrets()
+        if secrets.mt5_login is None:
+            raise RuntimeError("MT5_LOGIN must be set in the environment")
         broker.connect(
-            login=settings.account.expected_login,
+            login=secrets.mt5_login,
             server=settings.account.expected_server,
         )
         connected = True
         account = broker.account()
         terminal = broker.terminal_info()
         account_failures: list[str] = []
-        if account.login != settings.account.expected_login:
-            account_failures.append("account login does not match expected_login")
+        if account.login != secrets.mt5_login:
+            account_failures.append("account login does not match MT5_LOGIN")
         if account.server != settings.account.expected_server:
             account_failures.append("account server does not match expected_server")
         if not account.is_demo:

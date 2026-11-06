@@ -53,6 +53,7 @@ from bot.core.types import (
 )
 
 MAX_ENTRY_TICK_AGE = timedelta(minutes=10)
+CLOSE_ALL_RETRY_INTERVAL = timedelta(seconds=3)
 
 
 def _tick_is_fresh(tick: Tick, at_utc: datetime) -> bool:
@@ -1072,13 +1073,18 @@ class Engine:
                         actions.append(f"monthly-close:{position.ticket}")
 
             if self._store.get_flag("close_all_pending"):
-                for position in self._gateway.positions(
+                close_all_positions = self._gateway.positions(
                     self._settings.account.magic_number
-                ):
-                    if self._executor.close_position(position.ticket, ExitReason.CLOSE_ALL):
-                        actions.append(f"close-all:{position.ticket}")
-                if not self._gateway.positions(self._settings.account.magic_number):
+                )
+                if not close_all_positions:
                     self._store.set_flag("close_all_pending", False)
+                elif self._close_all_retry_due(now):
+                    self._store.set_meta("close_all_last_attempt_utc", now.isoformat())
+                    for position in close_all_positions:
+                        if self._executor.close_position(
+                            position.ticket, ExitReason.CLOSE_ALL
+                        ):
+                            actions.append(f"close-all:{position.ticket}")
 
             positions = self._gateway.positions(self._settings.account.magic_number)
             trades = {trade.ticket: trade for trade in self._store.open_trades()}
@@ -1141,6 +1147,13 @@ class Engine:
             if current_month is not None:
                 self._store.set_flag("halted_monthly", False)
             self._store.new_baseline("month", month_start.isoformat(), equity)
+
+    def _close_all_retry_due(self, now: datetime) -> bool:
+        last_attempt = self._store.get_meta("close_all_last_attempt_utc")
+        if last_attempt is None:
+            return True
+        previous = datetime.fromisoformat(last_attempt)
+        return now - previous >= CLOSE_ALL_RETRY_INTERVAL
 
     def _critical_alert(self, message: str) -> None:
         self._store.enqueue_alert(

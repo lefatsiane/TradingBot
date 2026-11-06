@@ -11,7 +11,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from bot.app.config import load_settings
 from bot.app.data import DataQualityError, Timeframe, read_history_cache
-from bot.app.replay_runner import run_replay
+from bot.app.replay_runner import claim_final_holdout_lock, run_replay
+from bot.app.versioning import get_version
 
 
 def main() -> None:
@@ -38,10 +39,16 @@ def main() -> None:
         action="store_true",
         help="Permit use of the most recent 12 months for the final evaluation run.",
     )
+    parser.add_argument(
+        "--cost-multiplier",
+        type=float,
+        default=1.0,
+        help="Scale replay spreads and slippage; use 2.0 for doubled-cost stress.",
+    )
     args = parser.parse_args()
 
     settings_path = Path(args.settings).resolve()
-    settings, _ = load_settings(settings_path)
+    settings, settings_version = load_settings(settings_path)
     data_dir = (
         Path(args.cache_dir).resolve()
         if args.cache_dir
@@ -81,6 +88,14 @@ def main() -> None:
 
     now = datetime.now(tz=UTC)
     try:
+        version = get_version(PROJECT_ROOT)
+        code_version = version.commit + ("-dirty" if not version.clean else "")
+        if args.final:
+            claim_final_holdout_lock(
+                reports_dir / "final-holdout.lock",
+                code_version=code_version,
+                created_at_utc=now,
+            )
         result = run_replay(
             histories,
             specs,
@@ -91,6 +106,9 @@ def main() -> None:
             no_news=args.no_news,
             strategy_mode=args.strategy,
             report_root=reports_dir,
+            code_version=code_version,
+            settings_version=settings_version,
+            cost_multiplier=args.cost_multiplier,
         )
     except (DataQualityError, ValueError, RuntimeError) as error:
         parser.error(str(error))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 from datetime import UTC, datetime, time
 from pathlib import Path
@@ -114,15 +115,28 @@ def test_next_weekend_close_utc_moves_to_following_friday_after_close() -> None:
 def test_runtime_secrets_come_only_from_environment() -> None:
     secrets = load_runtime_secrets(
         {
+            "MT5_LOGIN": "123456",
             "MT5_PASSWORD": "demo-secret",
             "TELEGRAM_TOKEN": "telegram-secret",
             "HEALTHCHECK_URL": "https://example.invalid/ping",
         }
     )
+    assert secrets.mt5_login == 123456
     assert secrets.mt5_password == "demo-secret"
     assert secrets.telegram_token == "telegram-secret"
     assert secrets.healthcheck_url == "https://example.invalid/ping"
-    assert load_runtime_secrets({}).mt5_password is None
+    empty_secrets = load_runtime_secrets({})
+    assert empty_secrets.mt5_login is None
+    assert empty_secrets.mt5_password is None
+
+
+@pytest.mark.parametrize("raw_login", ["", "abc", "0", "-1"])
+def test_runtime_secrets_reject_invalid_login_environment_value(raw_login: str) -> None:
+    if not raw_login:
+        assert load_runtime_secrets({"MT5_LOGIN": raw_login}).mt5_login is None
+        return
+    with pytest.raises(ValueError, match="MT5_LOGIN must be a positive integer"):
+        load_runtime_secrets({"MT5_LOGIN": raw_login})
 
 
 def test_startup_guard_reports_account_and_terminal_mismatches() -> None:
@@ -163,6 +177,28 @@ def test_settings_hash_is_stable_and_changes_with_configuration(tmp_path: Path) 
 
     assert identical_hash == original_hash
     assert changed_hash != original_hash
+
+
+def test_settings_hash_does_not_include_account_login(tmp_path: Path) -> None:
+    source = Path(__file__).parents[1] / "settings.toml"
+    text = source.read_text(encoding="utf-8")
+    first = tmp_path / "first-login.toml"
+    second = tmp_path / "second-login.toml"
+    first.write_text(
+        re.sub(r"(?m)^expected_login = \d+$", "expected_login = 123456", text),
+        encoding="utf-8",
+    )
+    second.write_text(
+        re.sub(r"(?m)^expected_login = \d+$", "expected_login = 654321", text),
+        encoding="utf-8",
+    )
+
+    first_settings, first_hash = load_settings(first)
+    second_settings, second_hash = load_settings(second)
+
+    assert first_hash == second_hash
+    assert first_settings.account.expected_login == 0
+    assert second_settings.account.expected_login == 0
 
 
 def test_simulator_costs_are_built_from_configured_symbol_settings() -> None:

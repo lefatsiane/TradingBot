@@ -77,9 +77,17 @@ class BrokerGateway:
             retries += 1
             delay_s = min(delay_s * 2.0, 30.0)
 
-    def run_serialized(self, operation: Callable[[Broker], T]) -> T:
+    def run_serialized(
+        self,
+        operation: Callable[[Broker], T],
+        *,
+        lock_timeout_s: float | None = None,
+    ) -> T:
         """Run a broker transaction under the gateway lock without nested acquisition."""
-        if not self._lock.acquire(timeout=self._lock_timeout_s):
+        timeout_s = self._lock_timeout_s if lock_timeout_s is None else lock_timeout_s
+        if timeout_s <= 0:
+            raise ValueError("Serialized operation lock timeout must be positive")
+        if not self._lock.acquire(timeout=timeout_s):
             self._degraded = True
             raise TimeoutError("Timed out waiting for broker lock: serialized operation")
         try:

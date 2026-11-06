@@ -1,9 +1,10 @@
 # Operations runbook
 
-> **Not ready for unattended operation.** `python -m bot.main run` and production
-> runtime wiring are not implemented. Do not start the bot against an account.
-> Complete demo verification in `../BLOCKED.md` before using any operational
-> procedure below.
+> **Not ready for unattended operation.** The `run` command and runtime wiring are
+> implemented, but no real MT5 terminal, Telegram phone, or scheduled task has
+> been verified. The enabled-symbol UTC schedules and owner-verified news data
+> are also prerequisites. Complete the demo verification in `../BLOCKED.md`
+> before considering unattended operation.
 
 ## Manual backup
 
@@ -19,22 +20,39 @@
 
    The tool writes one date-named backup and removes backups older than 14 days.
 5. Before any future restart, reconcile the database with the broker positions
-   and deals. Once the production Telegram control path is available and the
-   recovered market/account state is verified, send `/resume` only when no
-   daily, monthly, or error halt is active.
+   and deals. Once the Telegram control path is configured and the recovered
+   market/account state is verified, send `/resume` only when no daily, monthly,
+   or error halt is active.
 
 ## Healthcheck email alerts
 
-The heartbeat adapter is implemented but is not yet started by a production
-runtime. After runtime wiring, provide the healthchecks.io ping URL through the
-`HEALTHCHECK_URL` environment variable only. Configure the healthcheck's missed
-ping alert to email the owner, and verify delivery with the manual drill in
-[`drills.md`](./drills.md). Never put the URL in settings, logs, screenshots, or
-source control.
+When configured, the runtime starts the heartbeat adapter. Provide the
+healthchecks.io ping URL through the `HEALTHCHECK_URL` environment variable
+only. Configure the healthcheck's missed ping alert to email the owner, and
+verify delivery with the manual drill in [`drills.md`](./drills.md). Never put
+the URL in settings, logs, screenshots, or source control.
 
 ## Windows scheduled start
 
-Task Scheduler registration and Windows power/update settings are not yet
-implemented or tested. Do not create an unattended scheduled task until a
-demo-only `run` command, clean shutdown, restart recovery, and failure drills
-have passed.
+The installer is [`scripts/install_task.ps1`](../scripts/install_task.ps1). It
+registers `python -m bot.main run` with the project's `.venv\Scripts\python.exe`,
+the project working directory, and an at-logon trigger. Review its parameters
+and confirm the registration prompt; use `-WhatIf` to preview. The script has
+not been tested with Windows Task Scheduler.
+
+Before enabling an unattended start:
+
+1. Review and apply broker-derived UTC schedules; `run` refuses to start while
+   an enabled symbol has an empty or invalid schedule.
+2. Verify the demo account, order-free startup, restart recovery, Telegram, and
+   every drill in [`drills.md`](./drills.md).
+3. If Windows automatic logon is required, understand that it exposes the
+   account session to anyone with physical access. Do not enable it on an
+   unsecured device.
+4. Configure sleep to **Never** while plugged in and on battery if appropriate
+   for the device's role. Configure Windows active hours to prevent automatic
+   restarts during the trading week, and keep updates enabled outside those
+   hours.
+5. Confirm the scheduled task runs under the intended user and that its
+   environment variables are available to that user. The scheduled task must
+   never be used with a live account.

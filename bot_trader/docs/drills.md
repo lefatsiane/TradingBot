@@ -1,8 +1,16 @@
 # Demo failure drills
 
-> **Not yet operationally approved.** The current `bot.main` has no `run` command,
-> and Telegram/heartbeat threads are not wired into a production runtime. Do not
-> treat this checklist as evidence that the bot is ready to trade.
+> **Not yet operationally approved.** Runtime wiring exists, but it has not
+> been verified against the owner's MT5 demo terminal, phone, or laptop. Do not
+> treat these tests or this checklist as evidence that the bot is ready for
+> unattended trading.
+
+The automated simulator fault cases are covered across
+[`tests/test_executor.py`](../tests/test_executor.py),
+[`tests/test_engine.py`](../tests/test_engine.py),
+[`tests/test_broker.py`](../tests/test_broker.py), and
+[`tests/test_telegram.py`](../tests/test_telegram.py). They do not replace the
+manual demo drills below.
 
 Run these drills manually only after the owner has completed the demo-terminal
 checks in `../BLOCKED.md`. Use the demo account only; never use a live account.

@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from bot.adapters.broker import BrokerAccount
-from bot.app.config import load_settings
+from bot.adapters.sim_broker import SimCosts
+from bot.app.backtest import run_strategy_a_backtest
+from bot.app.config import build_simulator_costs, load_settings
 from bot.app.data import DataQualityError
-from bot.app.replay_runner import run_replay
+from bot.app.replay_runner import (
+    _simulator_costs,
+    _tick_for_candle,
+    claim_final_holdout_lock,
+    run_replay,
+)
+from bot.core.indicators import ema
+from bot.core.replay import ReplaySettings
+from bot.core.risk import RiskLimits
 from bot.core.types import Candle, SymbolSpec
 
 SPEC = SymbolSpec(
@@ -23,6 +34,51 @@ SPEC = SymbolSpec(
     100.0,
     contract_size=100_000.0,
 )
+
+
+def test_final_holdout_lock_is_exclusive_and_records_code_version(tmp_path) -> None:
+    lock_path = tmp_path / "reports" / "final-holdout.lock"
+    created = datetime(2026, 11, 3, 12, tzinfo=UTC)
+
+    claim_final_holdout_lock(
+        lock_path,
+        code_version="abc123-dirty",
+        created_at_utc=created,
+    )
+
+    assert json.loads(lock_path.read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "code_version": "abc123-dirty",
+        "created_at_utc": created.isoformat(),
+    }
+    with pytest.raises(ValueError, match="already locked"):
+        claim_final_holdout_lock(
+            lock_path,
+            code_version="different-version",
+            created_at_utc=created,
+        )
+
+
+def test_cost_multiplier_doubles_spread_and_slippage_not_commission() -> None:
+    settings = _settings()
+    candle = Candle(
+        datetime(2026, 10, 26, 8, tzinfo=UTC),
+        1.1,
+        1.1002,
+        1.0998,
+        1.1,
+        spread=0.00005,
+    )
+    base_tick = _tick_for_candle(candle)
+    stressed_tick = _tick_for_candle(candle, spread_multiplier=2)
+    base_cost = build_simulator_costs(settings, {"EURUSD"})["EURUSD"]
+    stressed_cost = _simulator_costs(settings, ("EURUSD",), 2)["EURUSD"]
+
+    assert stressed_tick.ask - stressed_tick.bid == pytest.approx(
+        2 * (base_tick.ask - base_tick.bid)
+    )
+    assert stressed_cost.slippage_points == 2 * base_cost.slippage_points
+    assert stressed_cost.commission_per_lot_side == base_cost.commission_per_lot_side
 
 
 def _settings():
@@ -94,6 +150,9 @@ def test_engine_replay_uses_simulator_and_writes_auditable_report(tmp_path) -> N
         final=True,
         no_news=True,
         report_root=tmp_path,
+        code_version="unit-test-commit",
+        settings_version="unit-test-settings",
+        cost_multiplier=2.0,
     )
 
     assert result.news_enabled is False
@@ -104,6 +163,12 @@ def test_engine_replay_uses_simulator_and_writes_auditable_report(tmp_path) -> N
     assert (result.report_dir / "trades.csv").is_file()
     assert (result.report_dir / "equity_curve.csv").is_file()
     assert (result.report_dir / "summary.json").is_file()
+    summary = json.loads(
+        (result.report_dir / "summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["code_version"] == "unit-test-commit"
+    assert summary["settings_version"] == "unit-test-settings"
+    assert summary["cost_multiplier"] == 2.0
 
 
 def test_engine_replay_rejects_recent_history_without_final_flag() -> None:
@@ -130,3 +195,145 @@ def test_engine_replay_rejects_recent_history_without_final_flag() -> None:
             final=False,
             no_news=True,
         )
+
+
+def _parity_fixture(start: datetime, count: int) -> tuple[Candle, ...]:
+    closes = [1.0 + index * 0.0001 for index in range(count)]
+    ema20 = ema(closes, 20)
+    candles: list[Candle] = []
+    timestamp = start
+    for close in closes:
+        while timestamp.weekday() >= 5 or timestamp.hour >= 22:
+            timestamp += timedelta(hours=1)
+        candles.append(
+            Candle(
+                timestamp,
+                close,
+                close + 0.0003,
+                close - 0.0003,
+                close,
+                spread=0.0001,
+            )
+        )
+        timestamp += timedelta(hours=1)
+    touched_index = count - 5
+    candle = candles[touched_index]
+    candles[touched_index] = Candle(
+        candle.time,
+        candle.open,
+        candle.high,
+        min(candle.low, ema20[touched_index]),
+        candle.close,
+        spread=candle.spread,
+    )
+    previous_index = count - 2
+    candle = candles[previous_index]
+    candles[previous_index] = Candle(
+        candle.time,
+        candle.open,
+        closes[previous_index] + 0.00005,
+        candle.low,
+        candle.close,
+        spread=candle.spread,
+    )
+    return tuple(candles)
+
+
+def test_engine_replay_strategy_a_matches_legacy_fixture_at_95_percent() -> None:
+    settings = _settings()
+    start = datetime(2026, 1, 1, 0, tzinfo=UTC)
+    h1 = _parity_fixture(start, 650)
+    last = h1[-1]
+    h1 = (
+        *h1,
+        Candle(
+            last.time + timedelta(hours=1),
+            last.close,
+            last.close + 0.0003,
+            last.close - 0.0003,
+            last.close,
+            spread=0.0001,
+        ),
+    )
+    h4 = tuple(
+        Candle(
+            start + timedelta(hours=index * 4),
+            1.1,
+            1.1002,
+            1.0998,
+            1.1001,
+            spread=0.0001,
+        )
+        for index in range(165)
+    )
+    now = h1[-1].time + timedelta(hours=1)
+    replay = run_replay(
+        {("EURUSD", "H1"): h1, ("EURUSD", "H4"): h4},
+        {"EURUSD": SPEC},
+        settings,
+        now_utc=now,
+        final=True,
+        no_news=True,
+        strategy_mode="a",
+    )
+    symbol_settings = settings.symbols["EURUSD"]
+    legacy = run_strategy_a_backtest(
+        h1,
+        SPEC,
+        settings.strategy_a.to_params(),
+        timeframe="H1",
+        now_utc=now,
+        magic_number=settings.account.magic_number,
+        settings=ReplaySettings(
+            starting_equity=3_000.0,
+            risk_per_trade_pct=settings.risk.risk_per_trade_pct,
+            commission_per_lot_side=symbol_settings.commission_per_lot_side,
+            slippage_price=symbol_settings.slippage_points * SPEC.point,
+            typical_spread_price=0.0001,
+            cost_gate_pct_of_risk=settings.risk.cost_gate_pct_of_risk,
+        ),
+        risk_limits=RiskLimits(
+            daily_loss_pct=settings.risk.daily_loss_pct,
+            monthly_loss_pct=settings.risk.monthly_loss_pct,
+            max_net_currency_exposure_pct=settings.risk.max_net_currency_exposure_pct,
+            max_open_trades=settings.risk.max_open_trades,
+            max_margin_used_pct=settings.risk.max_margin_used_pct,
+            cooldown_bars_after_stop=settings.risk.cooldown_bars_after_stop,
+        ),
+        costs=SimCosts(
+            commission_per_lot_side=symbol_settings.commission_per_lot_side,
+            slippage_points=symbol_settings.slippage_points,
+        ),
+        final=True,
+    )
+    legacy_entries = [
+        (trade.side.value, trade.entry_time, round(trade.entry_price, 8))
+        for trade in legacy.trades
+    ]
+    if legacy.open_trade is not None:
+        legacy_entries.append(
+            (
+                legacy.open_trade.side.value,
+                legacy.open_trade.entry_time,
+                round(legacy.open_trade.entry_price, 8),
+            )
+        )
+    replay_entries = [
+        (deal.side.value, deal.time_utc, round(deal.price, 8))
+        for deal in replay.deals
+        if deal.is_entry is True
+    ]
+    legacy_trades = len(legacy_entries)
+    replay_trades = len(replay_entries)
+    matched_trades = sum(entry in replay_entries for entry in legacy_entries)
+    parity_pct = (
+        100.0
+        if legacy_trades == replay_trades == 0
+        else matched_trades / max(legacy_trades, replay_trades) * 100
+    )
+
+    assert legacy_trades > 0
+    assert parity_pct == 100.0, (
+        f"Strategy A replay parity was {parity_pct:.1f}% "
+        f"({matched_trades}/{max(legacy_trades, replay_trades)} trades)"
+    )

@@ -25,20 +25,30 @@
 
 ## Tasks 6 and 10: Runtime acceptance
 
-- The engine's entry and management methods have focused simulator tests, but a full replayed week,
-  restart mid-day acceptance, periodic runtime loop, and production MT5 wiring are incomplete.
-- The normal `bot.main` command remains configuration/schedule validation only. It cannot start a
-  trading runtime and must not be used to infer readiness.
-- The Telegram/control and heartbeat components, crash-loop helper, SQLite backup utility, and
-  runbook/drill documents exist, but none is connected to a production `run` command.
+- The demo-only `bot.main run` path now wires the Windows file lock, crash-loop guard, MT5 broker,
+  gateway, startup guard and recovery, periodic management/entry lanes, optional Telegram/heartbeat
+  threads, sizing diagnostics, shutdown signals, and cleanup. Focused `SimBroker` tests cover the
+  lock, crash-loop flag, and clean shutdown preserving a protected position.
+- The runtime has not been run against the owner's MT5 demo terminal. Do not infer demo account
+  compatibility, restart recovery, phone control, or order safety from simulator results.
+- Enabled symbols in `bot_trader/settings.toml` still have empty `hours_utc`; runtime refuses to start
+  until the owner applies reviewed broker-derived schedules. The news calendar also remains
+  owner-verified data.
+- The Task Scheduler installer and manual Windows settings are documented, but Task Scheduler and
+  laptop configuration have not been tested.
 
-## Tasks 7 and 12: Replay/statistics implementation
+## Tasks 7, 11, and 12: Replay/statistics acceptance
 
-- The multi-symbol replay runner, live-engine parity acceptance, portfolio statistics harness, and
-  holdout lock are not implemented. A parity or performance result must not be inferred from the
-  existing single-symbol Strategy A backtest.
-- The empty enabled-symbol schedules in `settings.toml` prevent a meaningful gate-enabled replay
-  until the owner reviews and applies broker-derived UTC hours. Do not invent session hours.
+- The multi-symbol engine-backed replay runner and fixed-fixture Strategy A parity test are
+  implemented. A useful full-portfolio replay still requires reviewed UTC schedules and complete,
+  validated caches; no full six-pair portfolio result should be inferred.
+- Simulator failure cases are covered across focused tests. Manual restart, connectivity, phone,
+  heartbeat/email, and demo-trade drills remain owner tasks.
+- `tools/stats.py` computes candle-close drawdown, 10,000-resample calendar-week confidence
+  intervals, doubled-cost stress comparisons, and a date/versioned scorecard. The `--final` replay
+  lock is exclusive and records the code version. Random-entry controls,
+  per-instrument/timeframe statistics, variant counting, and parameter sensitivity are not
+  implemented; absent scorecard evidence is `INCONCLUSIVE`.
 
 ## Git workflow
 

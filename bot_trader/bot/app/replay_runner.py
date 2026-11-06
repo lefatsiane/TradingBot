@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from bot.adapters.broker import BrokerAccount, BrokerDeal, Tick
 from bot.adapters.gateway import BrokerGateway
-from bot.adapters.sim_broker import SimBroker
+from bot.adapters.sim_broker import SimBroker, SimCosts
 from bot.adapters.store import StateStore
 from bot.app.backtest import EquityPoint, select_backtest_history
 from bot.app.config import (
@@ -27,11 +27,11 @@ from bot.app.data import DataQualityError, Timeframe
 from bot.app.engine import Engine
 from bot.app.executor import Executor
 from bot.core.clock import SimClock
+from bot.core.timeutil import expected_new_york_offset
 from bot.core.types import Candle, Decision, SymbolSpec
 
 StrategyMode = Literal["a", "b", "both"]
 HistoryMap = Mapping[tuple[str, Timeframe], tuple[Candle, ...]]
-SIMULATED_SERVER_OFFSET_HOURS = 3  # DECISION-PENDING: confirm the broker-server offset policy.
 DEFAULT_STARTING_EQUITY = 3_000.0
 
 
@@ -40,6 +40,9 @@ class ReplayRunResult:
     strategy_mode: StrategyMode
     starting_equity: float
     ending_equity: float
+    cost_multiplier: float
+    code_version: str
+    settings_version: str
     decisions: tuple[Decision, ...]
     deals: tuple[BrokerDeal, ...]
     equity_curve: tuple[EquityPoint, ...]
@@ -62,6 +65,9 @@ def run_replay(
     no_news: bool = False,
     strategy_mode: StrategyMode = "both",
     report_root: str | Path | None = None,
+    code_version: str = "replay",
+    settings_version: str = "replay",
+    cost_multiplier: float = 1.0,
 ) -> ReplayRunResult:
     """Replay cached candles through the production Engine, Executor and SimBroker."""
     now = _require_utc(now_utc, "now_utc")
@@ -71,6 +77,8 @@ def run_replay(
         raise ValueError("Replay requires demo-only settings with live trading disabled")
     if starting_equity <= 0 or not isfinite(starting_equity):
         raise ValueError("starting_equity must be positive")
+    if cost_multiplier <= 0 or not isfinite(cost_multiplier):
+        raise ValueError("cost_multiplier must be positive and finite")
 
     enabled_symbols = tuple(
         name for name, symbol_settings in settings.symbols.items() if symbol_settings.enabled
@@ -116,7 +124,7 @@ def run_replay(
         symbol: selected_histories[(symbol, "H1")][0] for symbol in enabled_symbols
     }
     initial_ticks = {
-        symbol: _tick_for_candle(candle)
+        symbol: _tick_for_candle(candle, spread_multiplier=cost_multiplier)
         for symbol, candle in first_h1.items()
     }
     simulated_account = account or BrokerAccount(
@@ -139,11 +147,11 @@ def run_replay(
         specs={symbol: specs[symbol] for symbol in enabled_symbols},
         tick_data=initial_ticks,
         clock=clock,
-        costs=build_simulator_costs(settings, enabled_symbols),
+        costs=_simulator_costs(settings, enabled_symbols, cost_multiplier),
         session_hours={
             symbol: settings.symbols[symbol].hours_utc for symbol in enabled_symbols
         },
-        server_offset_hours=SIMULATED_SERVER_OFFSET_HOURS,
+        server_offset_hours=expected_new_york_offset(first_time),
     )
     gateway = BrokerGateway(broker, max_retries=0)
     temp_dir = tempfile.TemporaryDirectory(prefix="tradingbot-replay-")
@@ -160,8 +168,8 @@ def run_replay(
             magic_number=settings.account.magic_number,
             max_send_retries=settings.execution.max_send_retries,
             unknown_outcome_wait_s=settings.execution.unknown_outcome_wait_s,
-            code_version="replay",
-            settings_version="replay",
+            code_version=code_version,
+            settings_version=settings_version,
             commission_per_lot_side={
                 symbol: settings.symbols[symbol].commission_per_lot_side
                 for symbol in enabled_symbols
@@ -169,8 +177,8 @@ def run_replay(
             wait=lambda _: None,
         ),
         clock,
-        code_version="replay",
-        settings_version="replay",
+        code_version=code_version,
+        settings_version=settings_version,
         news_enabled=not no_news,
         strategy_mode=strategy_mode,
     )
@@ -188,7 +196,13 @@ def run_replay(
         )
         for at_utc in events:
             clock.set(at_utc)
-            _update_market(broker, selected_histories, enabled_symbols, at_utc)
+            _update_market(
+                broker,
+                selected_histories,
+                enabled_symbols,
+                at_utc,
+                spread_multiplier=cost_multiplier,
+            )
             decisions.extend(engine.run_entry_lane())
             for symbol in enabled_symbols:
                 candle = _candle_at(selected_histories[(symbol, "H1")], at_utc)
@@ -225,6 +239,9 @@ def run_replay(
             strategy_mode=strategy_mode,
             starting_equity=starting_equity,
             ending_equity=final_account.equity,
+            cost_multiplier=cost_multiplier,
+            code_version=code_version,
+            settings_version=settings_version,
             decisions=tuple(decisions),
             deals=deals,
             equity_curve=tuple(equity_curve),
@@ -299,6 +316,9 @@ def write_replay_report(
         "strategy": result.strategy_mode,
         "news_enabled": result.news_enabled,
         "final_run": result.final_run,
+        "cost_multiplier": result.cost_multiplier,
+        "code_version": result.code_version,
+        "settings_version": result.settings_version,
         "starting_equity": result.starting_equity,
         "ending_equity": result.ending_equity,
         "net_profit": result.ending_equity - result.starting_equity,
@@ -324,18 +344,51 @@ def write_replay_report(
     return run_dir
 
 
+def claim_final_holdout_lock(
+    lock_path: str | Path,
+    *,
+    code_version: str,
+    created_at_utc: datetime,
+) -> Path:
+    created = _require_utc(created_at_utc, "created_at_utc")
+    if not code_version.strip():
+        raise ValueError("code_version must not be empty")
+    path = Path(lock_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "code_version": code_version,
+        "created_at_utc": created.isoformat(),
+    }
+    try:
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as error:
+        raise ValueError(f"Final holdout is already locked at {path}") from error
+    with os.fdopen(descriptor, "w", encoding="utf-8") as lock_file:
+        lock_file.write(json.dumps(payload, indent=2, allow_nan=False) + "\n")
+        lock_file.flush()
+        os.fsync(lock_file.fileno())
+    return path
+
+
 def _update_market(
     broker: SimBroker,
     histories: Mapping[tuple[str, Timeframe], tuple[Candle, ...]],
     symbols: tuple[str, ...],
     at_utc: datetime,
+    *,
+    spread_multiplier: float,
 ) -> None:
     for symbol in symbols:
+        broker.server_offset_hours = expected_new_york_offset(at_utc)
         h1_history = histories[(symbol, "H1")]
         current_h1 = tuple(candle for candle in h1_history if candle.time <= at_utc)
         broker.candle_data[(symbol, "H1")] = current_h1
         current_candle = current_h1[-1] if current_h1 else h1_history[0]
-        broker.tick_data[symbol] = _tick_for_candle(current_candle)
+        broker.tick_data[symbol] = _tick_for_candle(
+            current_candle,
+            spread_multiplier=spread_multiplier,
+        )
         for timeframe in ("H1", "H4"):
             key = (symbol, timeframe)
             if key in histories:
@@ -344,9 +397,23 @@ def _update_market(
                 )
 
 
-def _tick_for_candle(candle: Candle) -> Tick:
-    spread = candle.spread
+def _tick_for_candle(candle: Candle, *, spread_multiplier: float = 1.0) -> Tick:
+    spread = candle.spread * spread_multiplier
     return Tick(candle.time, candle.open, candle.open + spread)
+
+
+def _simulator_costs(
+    settings: Settings,
+    symbols: tuple[str, ...],
+    cost_multiplier: float,
+) -> dict[str, SimCosts]:
+    return {
+        symbol: replace(
+            cost,
+            slippage_points=cost.slippage_points * cost_multiplier,
+        )
+        for symbol, cost in build_simulator_costs(settings, symbols).items()
+    }
 
 
 def _candle_at(candles: tuple[Candle, ...], at_utc: datetime) -> Candle | None:

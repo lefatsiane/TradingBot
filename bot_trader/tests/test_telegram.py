@@ -55,16 +55,17 @@ def test_poller_filters_chats_and_edited_messages_and_persists_cursor(tmp_path) 
     clock = SimClock(NOW)
     control = ControlHandler(store, clock)
     updates = [
-        _update(1, 123, "/stop_new", NOW),
+        _update(1, 999, "/stop_new", NOW),
+        _update(2, 123, "/stop_new", NOW),
         {
-            "update_id": 2,
+            "update_id": 3,
             "edited_message": {
                 "chat": {"id": 123, "type": "private"},
                 "text": "/resume",
             },
         },
         {
-            "update_id": 3,
+            "update_id": 4,
             "message": {
                 "date": int(NOW.timestamp()),
                 "chat": {"id": -123, "type": "group"},
@@ -91,7 +92,7 @@ def test_poller_filters_chats_and_edited_messages_and_persists_cursor(tmp_path) 
     adapter.poll_once()
 
     assert store.get_flag("stop_new")
-    assert store.last_telegram_update_id() == 3
+    assert store.last_telegram_update_id() == 4
     assert sum(call[1].get("text") == "New entries stopped." for call in session.calls) == 1
     assert len(session.calls) == 2
 
