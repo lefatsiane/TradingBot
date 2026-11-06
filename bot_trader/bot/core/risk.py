@@ -4,7 +4,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from math import isfinite
 
-from bot.core.types import OpenRisk, Side, SymbolSpec
+from bot.core.types import OpenRisk, ReasonCode, Side, SymbolSpec
+
+CREDIT_REALIZED_PROFITS_TO_DAILY_HEADROOM = False
+# DECISION-PENDING: keep this conservative until the owner decides if profits may
+# restore risk headroom.
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +89,29 @@ class EntryRiskResult:
     daily_headroom_pct: float
 
 
+def entry_slot_reason(
+    *,
+    symbol: str,
+    positions: Iterable[OpenRisk],
+    pending: Iterable[OpenRisk],
+    bars_since_stop: int | None,
+    limits: RiskLimits | None = None,
+) -> ReasonCode | None:
+    if limits is None:
+        limits = RiskLimits()
+    if bars_since_stop is not None and bars_since_stop < 0:
+        raise ValueError("bars_since_stop cannot be negative")
+    all_risks = [*positions, *pending]
+    if any(position.symbol == symbol for position in all_risks):
+        return ReasonCode.SLOT_TAKEN
+    if (
+        bars_since_stop is not None
+        and bars_since_stop < limits.cooldown_bars_after_stop
+    ):
+        return ReasonCode.COOLDOWN
+    return None
+
+
 def currency_exposure(
     positions: Iterable[OpenRisk],
     specs: dict[str, SymbolSpec],
@@ -140,25 +167,28 @@ def evaluate_entry(
     current = list(positions)
     inflight = list(pending)
     all_risks = current + inflight
+    realized_pnl_for_headroom = realized_pnl_today
+    if not CREDIT_REALIZED_PROFITS_TO_DAILY_HEADROOM:
+        realized_pnl_for_headroom = min(realized_pnl_for_headroom, 0.0)
     headroom = max(
         0.0,
         limits.daily_loss_pct
-        + realized_pnl_today / start_of_day_equity * 100.0,
+        + realized_pnl_for_headroom / start_of_day_equity * 100.0,
     )
     headroom = max(0.0, headroom - sum(position.risk_pct for position in all_risks))
-    if new_risk_pct > headroom + 1e-12:
-        return EntryRiskResult(False, "DAILY_HEADROOM", (), headroom)
-    if len(all_risks) >= limits.max_open_trades:
-        return EntryRiskResult(False, "MAX_TRADES", (), headroom)
-    if any(position.symbol == symbol for position in all_risks):
-        return EntryRiskResult(False, "SLOT_TAKEN", (), headroom)
-    if (
-        bars_since_stop is not None
-        and bars_since_stop < limits.cooldown_bars_after_stop
-    ):
-        return EntryRiskResult(False, "COOLDOWN", (), headroom)
+    slot_reason = entry_slot_reason(
+        symbol=symbol,
+        positions=all_risks,
+        pending=(),
+        bars_since_stop=bars_since_stop,
+        limits=limits,
+    )
+    if slot_reason is not None:
+        return EntryRiskResult(False, slot_reason.value, (), headroom)
     if margin_used_after_pct > limits.max_margin_used_pct:
         return EntryRiskResult(False, "NO_MARGIN", (), headroom)
+    if len(all_risks) >= limits.max_open_trades:
+        return EntryRiskResult(False, "MAX_TRADES", (), headroom)
 
     spec = specs.get(symbol)
     if spec is None:
@@ -175,4 +205,6 @@ def evaluate_entry(
         return EntryRiskResult(
             False, "CURRENCY_EXPOSURE", tuple(sorted(exposure.items())), headroom
         )
+    if new_risk_pct > headroom + 1e-12:
+        return EntryRiskResult(False, "DAILY_HEADROOM", (), headroom)
     return EntryRiskResult(True, None, tuple(sorted(exposure.items())), headroom)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from bot.app.config import load_settings
+from bot.app.config import load_settings, schedule_validation_failures
 
 
 def main() -> int:
@@ -19,6 +19,12 @@ def main() -> int:
         settings, version = load_settings(args.settings)
     except (OSError, ValueError) as error:
         print(f"Configuration error: {error}", file=sys.stderr)
+        return 2
+    schedule_failures = schedule_validation_failures(settings)
+    if schedule_failures:
+        print("Schedule validation failed:", file=sys.stderr)
+        for failure in schedule_failures:
+            print(f"- {failure}", file=sys.stderr)
         return 2
     print(
         f"Configuration valid: mode={settings.account.mode}, "

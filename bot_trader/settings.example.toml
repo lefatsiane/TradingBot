@@ -1,0 +1,127 @@
+schema_version = 1
+
+[account]
+expected_login = 0
+expected_server = "ICMarketsSC-Demo"
+mode = "demo"
+allow_live = false
+magic_number = 7261026
+
+[risk]
+risk_per_trade_pct = 0.5
+daily_loss_pct = 1.0
+monthly_loss_pct = 3.0
+max_net_currency_exposure_pct = 1.0
+max_open_trades = 3
+cost_gate_pct_of_risk = 15.0
+max_margin_used_pct = 30.0
+cooldown_bars_after_stop = 6
+
+[timing]
+fast_tick_s = 2
+candle_poll_s = 5
+no_new_entries_before_weekend_close_min = 120
+flatten_before_weekend_close_min = 30
+rollover_block_before_min = 10
+rollover_block_after_min = 30
+
+[news]
+calendar_file = "config/news.csv"
+min_days_covered = 7
+block_before_min = 30
+block_after_min = 30
+
+[gates]
+max_candle_range_atr = 3.0
+
+[execution]
+deviation_points = 20
+max_send_retries = 1
+unknown_outcome_wait_s = 15
+
+[control]
+telegram_chat_id = 0
+command_max_age_s = 60
+
+[symbols.EURUSD]
+enabled = true
+commission_per_lot_side = 3.50
+slippage_points = 2
+max_spread_points = 10
+hours_utc = []
+
+[symbols.GBPUSD]
+enabled = true
+commission_per_lot_side = 3.50
+slippage_points = 2
+max_spread_points = 10
+hours_utc = []
+
+[symbols.USDJPY]
+enabled = true
+commission_per_lot_side = 3.50
+slippage_points = 2
+max_spread_points = 10
+hours_utc = []
+
+[symbols.USDCHF]
+enabled = true
+commission_per_lot_side = 3.50
+slippage_points = 2
+max_spread_points = 10
+hours_utc = []
+
+[symbols.AUDUSD]
+enabled = true
+commission_per_lot_side = 3.50
+slippage_points = 2
+max_spread_points = 10
+hours_utc = []
+
+[symbols.NZDUSD]
+enabled = true
+commission_per_lot_side = 3.50
+slippage_points = 2
+max_spread_points = 10
+hours_utc = []
+
+[symbols.XAUUSD]
+enabled = false
+commission_per_lot_side = 3.50
+slippage_points = 2
+max_spread_points = 100
+hours_utc = []
+
+[strategy_a]
+timeframes = ["H1", "H4"]
+ema_fast = 20
+ema_trend = 50
+ema_slow = 200
+atr_period = 14
+slope_lookback = 20
+pullback_window = 5
+stop_lookback = 5
+stop_buffer_atr = 0.25
+min_stop_atr = 1.0
+max_stop_atr = 3.0
+take_profit_r = 2.0
+min_candles = 600
+window_candles = 1000
+cooldown_bars_after_stop = 6
+
+[strategy_b]
+bollinger_period = 20
+bollinger_deviations = 2.0
+rsi_period = 14
+rsi_oversold = 30.0
+rsi_overbought = 70.0
+adx_period = 14
+adx_quiet_max = 20.0
+atr_period = 14
+stop_lookback = 3
+stop_buffer_atr = 0.25
+min_stop_atr = 1.0
+max_stop_atr = 3.0
+min_reward_r = 1.0
+time_stop_candles = 24
+cooldown_bars_after_stop = 6

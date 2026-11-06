@@ -6,6 +6,7 @@ from bot.core.timeutil import (
     broker_to_utc,
     month_start_utc,
     next_month_boundary_utc,
+    next_rollover_utc,
     next_trading_day_boundary_utc,
     trading_day_start_utc,
 )
@@ -47,3 +48,36 @@ def test_next_trading_day_boundary_is_after_the_input() -> None:
     boundary = next_trading_day_boundary_utc(at_utc, 2)
     assert boundary > at_utc
     assert boundary == datetime(2026, 11, 1, 22, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("at_utc", "offset", "expected"),
+    [
+        (
+            datetime(2026, 3, 8, 6, 30, tzinfo=UTC),
+            2,
+            datetime(2026, 3, 8, 21, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 3, 8, 7, 30, tzinfo=UTC),
+            3,
+            datetime(2026, 3, 8, 21, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 11, 1, 5, 30, tzinfo=UTC),
+            3,
+            datetime(2026, 11, 1, 22, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 11, 1, 6, 30, tzinfo=UTC),
+            2,
+            datetime(2026, 11, 1, 22, tzinfo=UTC),
+        ),
+    ],
+)
+def test_next_rollover_uses_the_next_dst_aware_server_midnight(
+    at_utc: datetime,
+    offset: int,
+    expected: datetime,
+) -> None:
+    assert next_rollover_utc(at_utc, offset) == expected

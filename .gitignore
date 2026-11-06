@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.*
+bot_trader/settings.toml
+bot_trader/state/
+bot_trader/logs/
+bot_trader/backups/

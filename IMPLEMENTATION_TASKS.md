@@ -66,16 +66,16 @@ Give your AI assistant **one task at a time**, plus the matching section of
 
 ## 0. Housekeeping and small gaps (do first, about an hour)
 
-- [ ] **0.1 `tests/test_architecture.py`** (planned in the task list but missing). Walk every `.py`
+- [x] **0.1 `tests/test_architecture.py`** (planned in the task list but missing). Walk every `.py`
   file under `bot/` with `ast`. Fail if any file other than `bot/adapters/mt5_broker.py` imports
   `MetaTrader5`. Fail if any file in `bot/core/` imports `MetaTrader5`, `sqlite3`, `requests`,
   `bot.adapters` or `bot.app`, or calls `datetime.now`, `datetime.utcnow`, `date.today` or `time.time`.
   Run it; fix any real violation it finds (do not weaken the test).
-- [ ] **0.2 Repo hygiene.** Add a root-level `.gitignore` (parent of `bot_trader/`) containing
+- [x] **0.2 Repo hygiene.** Add a root-level `.gitignore` (parent of `bot_trader/`) containing
   `__pycache__/`, `*.pyc`, `.venv/`; run `git rm -r --cached __pycache__`. Optional: move the real
   `expected_login` out of the public repo by committing `settings.example.toml` and git-ignoring
   `settings.toml`. Update README setup text if you do this.
-- [ ] **0.3 Strategy B parameter object.** `strategy_b.py` hard-codes its constants while
+- [x] **0.3 Strategy B parameter object.** `strategy_b.py` hard-codes its constants while
   `StrategyBSettings` exists. Add a frozen `StrategyBParams` dataclass (mirroring `StrategyAParams`),
   `StrategyBSettings.to_params()`, and change the signature to
   `propose(candles, params, *, timeframe="H1")`. Behaviour must be identical for default params
@@ -93,19 +93,19 @@ Give your AI assistant **one task at a time**, plus the matching section of
 empty session list **fails closed**. All `hours_utc` in `settings.toml` are empty today, so the bot can
 never trade until this and task 4 are done.
 
-- [ ] **1.1 `hours_utc` format.** In `bot/app/config.py` define and validate the string format for
+- [x] **1.1 `hours_utc` format.** In `bot/app/config.py` define and validate the string format for
   `SymbolSettings.hours_utc`, e.g. `"mon 00:00-21:55"`, `"fri 00:00-21:55"` (weekday `mon..sun`, 24h UTC,
   one entry per window; a window that crosses midnight is two entries). Reject bad strings at load.
   Add `parse_sessions(hours: tuple[str, ...]) -> tuple[SessionWindow, ...]` (in `bot/app/config.py` or
   `bot/core/schedule.py`).
-- [ ] **1.2 `next_weekend_close_utc(now_utc, sessions) -> datetime`** in `bot/core/` (pure): the next
+- [x] **1.2 `next_weekend_close_utc(now_utc, sessions) -> datetime`** in `bot/core/` (pure): the next
   Friday session end in UTC at or after `now_utc`. Raise if `sessions` has no Friday window.
-- [ ] **1.3 `next_rollover_utc(now_utc, offset_hours)`**: just wrap the existing
+- [x] **1.3 `next_rollover_utc(now_utc, offset_hours)`**: just wrap the existing
   `next_trading_day_boundary_utc` (server midnight) with a clear name and test it across both DST
   shifts (server UTC+3 to UTC+2 around 1 Nov).
-- [ ] **1.4 Startup schedule validation:** a function returning failures if an enabled symbol has an
+- [x] **1.4 Startup schedule validation:** a function returning failures if an enabled symbol has an
   empty `hours_utc`, no Friday window, or overlapping windows. `bot.main validate` must report these.
-- [ ] **Tests:** window edges for every helper, DST weeks, `weekend_close < now` rejected.
+- [x] **Tests:** window edges for every helper, DST weeks, `weekend_close < now` rejected.
 
 **Done when:** given a settings file and `now`, you can compute everything `evaluate_entry_gates` needs.
 
@@ -116,43 +116,45 @@ never trade until this and task 4 are done.
 Read the existing `CREATE TABLE` statements first; add only what is missing via a **numbered migration**
 (migrations must run twice safely, existing tests stay green).
 
-- [ ] **2.1 Trade closing:** `close_trade(ticket, closed_at_utc, close_price, profit, commission, exit_reason)`;
+- [x] **2.1 Trade closing:** `close_trade(ticket, closed_at_utc, close_price, profit, commission, exit_reason)`;
   add an `ExitReason` `StrEnum` in `types.py`: `STOP_LOSS`, `TAKE_PROFIT`, `TIME_STOP`, `WEEKEND_FLATTEN`,
   `MONTHLY_CAP`, `CLOSE_ALL`, `MANUAL`, `UNKNOWN`. Store it on the trade row.
-- [ ] **2.2 Queries:** `open_trades() -> tuple[TradeRecord, ...]`; `get_bar_progress(symbol, timeframe) -> str | None`;
+- [x] **2.2 Queries:** `open_trades() -> tuple[TradeRecord, ...]`; `get_bar_progress(symbol, timeframe) -> str | None`;
   `realized_pnl_between(start_utc, end_utc) -> float` (net of commission); `last_stop_out_utc(symbol, timeframe) -> str | None`
   (for the 6-candle cooldown); `get_intent(intent_id)`, `find_intent_by_key(key)`.
-- [ ] **2.3 Start log for the crash-loop guard:** table `starts(started_at_utc, planned INTEGER)`,
+- [x] **2.3 Start log for the crash-loop guard:** table `starts(started_at_utc, planned INTEGER)`,
   `record_start(at_utc, planned)`, `unplanned_starts_since(since_utc) -> int`. A clean shutdown writes
   `planned=1` on the next start by clearing a `clean_shutdown` marker.
-- [ ] **2.4 Heartbeat snapshot:** `set_meta(key, value)` / `get_meta(key)` for small values (last
+- [x] **2.4 Heartbeat snapshot:** `set_meta(key, value)` / `get_meta(key)` for small values (last
   engine heartbeat UTC, clean_shutdown marker).
-- [ ] **Tests (`tests/test_store.py`):** each new method, migration 2 to 3 on a populated DB,
+- [x] **Tests (`tests/test_store.py`):** each new method, migration 2 to 3 on a populated DB,
   two threads writing, UTC-only timestamps enforced.
 
 ---
 
 ## 3. Live MetaTrader adapter (`bot/adapters/mt5_broker.py`)
 
+**Status:** Adapter implementation and fake-API tests are complete. Manual demo-terminal verification remains blocked; see `BLOCKED.md` and the pending offset question in `QUESTIONS.md`.
+
 Keep `MT5ReadOnlyBroker` untouched (history tooling uses it). Add a second class `MT5Broker` that
 implements the **full** `Broker` protocol. It stays the only file that imports `MetaTrader5`.
 
-- [ ] **3.1 Extend the injected `_MT5API` protocol** with `login`, `account_info`, `positions_get`,
+- [x] **3.1 Extend the injected `_MT5API` protocol** with `login`, `account_info`, `positions_get`,
   `history_deals_get`, `order_check`, `order_send`, `order_calc_margin`, `symbol_select` and the
   needed `TRADE_ACTION_*`, `ORDER_TYPE_*`, `ORDER_FILLING_*`, `TRADE_RETCODE_*` constants, so every test
   uses a fake API and no real terminal.
-- [ ] **3.2 Reads:** `account()` (login, server, currency, balance, equity, `is_demo` from trade mode,
+- [x] **3.2 Reads:** `account()` (login, server, currency, balance, equity, `is_demo` from trade mode,
   `margin_mode` as `"hedging"`/`"netting"`/`"exchange"`, `trade_allowed`, leverage), `terminal_info()`,
   `positions(magic)`, `history_deals(since_utc, magic)`, `calculate_margin(request)`. Convert all MT5
   server-time epochs with `broker_to_utc(epoch, offset)`; never assume an offset.
-- [ ] **3.3 Server offset.** The standard API has no offset property. Implement a provider that reads
+- [x] **3.3 Server offset.** The standard API has no offset property. Implement a provider that reads
   the latest tick's server timestamp for a liquid symbol (EURUSD), requires the tick to be fresh
   (under 60 s old), subtracts real UTC from the injected clock, rounds to whole hours, then passes the
   result through `check_broker_offset`. Refuse (raise) when the market is closed or the tick is stale.
   *Decision for Lefa:* the current code comment says not to infer the offset from UTC ticks; this
   approach is the one `connection_test.py` already used, but it must be run on a weekday with open
   markets and cross-checked once by eye against MT5's server clock before relying on it.
-- [ ] **3.4 `check(request)` and `send_market(request)`:** build a `TRADE_ACTION_DEAL` request with
+- [x] **3.4 `check(request)` and `send_market(request)`:** build a `TRADE_ACTION_DEAL` request with
   symbol, volume, type from `Side`, price from the current tick (ask for long, bid for short), `sl`,
   `tp`, `deviation` (from `settings.execution.deviation_points`), `magic`, `comment = intent_id`
   (numeric, at most 31 chars), and a **fill mode picked from the symbol's allowed modes**
@@ -160,30 +162,35 @@ implements the **full** `Broker` protocol. It stays the only file that imports `
   (`DONE`, `INVALID_STOPS`, `INVALID_FILL`, `PRICE_OFF`, `CONNECTION`, plus `REQUOTE`, `REJECTED`,
   `NO_MONEY`, `MARKET_CLOSED`, `TIMEOUT`, `UNKNOWN`). Return `None` when no result came back
   (outcome unknown). Fill `ticket`, `price`, `lots`, and `commission` when known.
-- [ ] **3.5 `modify_sl_tp(ticket, sl, tp)` and `close(ticket)`** (opposite-side market order against
+- [x] **3.5 `modify_sl_tp(ticket, sl, tp)` and `close(ticket)`** (opposite-side market order against
   that ticket; on a hedging account use `position=` in the request). Same retcode mapping.
-- [ ] **3.6 Terminal state:** `connect()` initialises with login/server and reads the password from the
+- [x] **3.6 Terminal state:** `connect()` initialises with login/server and reads the password from the
   environment value passed in by the caller (never from settings); `shutdown()` on exit.
-- [ ] **Tests (`tests/test_mt5_broker.py`):** fake API; one test per retcode mapping, comment length,
+- [x] **Tests (`tests/test_mt5_broker.py`):** fake API; one test per retcode mapping, comment length,
   fill-mode selection, hedging vs netting close, `None` result when the fake raises a timeout.
 
 **Done when:** with a fake API every `Broker` protocol method works, and a manual one-off script
 (outside the repo) can call `account()`, `positions()` and `candles()` against the real demo terminal.
 
+The fake-API implementation is complete. The manual real-demo check has not been run; do not treat
+section 3 as fully verified until the blocker in `BLOCKED.md` is cleared.
+
 ---
 
 ## 4. `tools/validate_symbols.py`
 
-- [ ] For each symbol in `settings.toml`: fetch spec, tick, 6 months of H1 history and the broker's
+- [x] For each symbol in `settings.toml`: fetch spec, tick, 6 months of H1 history and the broker's
   session times; check volume min/step against sizing at `risk_per_trade_pct` (reports
   `BELOW_MIN_LOT` risk), spread behaviour against `max_spread_points`, history length, and that the
   symbol is selectable. Print a table and exit non-zero if any enabled symbol fails.
-- [ ] Write the weekly trading hours in UTC (format from task 1.1) into the `hours_utc` of each
+- [x] Write the weekly trading hours in UTC (format from task 1.1) into the `hours_utc` of each
   passing symbol. Do not edit risk or strategy sections. Do it as a printed suggestion plus a
   `--write` flag that edits only `hours_utc`.
-- [ ] **Tests:** run against `SimBroker`; a symbol with too-large minimum lot is reported and not enabled.
+- [x] **Tests:** run against `SimBroker`; a symbol with too-large minimum lot is reported and not enabled.
 
-**Done when:** the six pairs pass, `hours_utc` is filled for each, and `python -m bot.main validate` reports no schedule failures.
+**Code/tests done; owner acceptance blocked:** the six pairs have not been checked against the
+demo terminal, `settings.toml` hours remain unchanged, and `python -m bot.main validate` correctly
+reports the six enabled symbols with empty schedules.
 (XAUUSD stays disabled until its minimum size passes the risk check, as already noted in the config.)
 
 ---
@@ -192,29 +199,29 @@ implements the **full** `Broker` protocol. It stays the only file that imports `
 
 All order traffic goes through this class, which uses `BrokerGateway`, `StateStore` and a `Clock`.
 
-- [ ] **5.1 Return-code policy table** (module-level dict, one place only). For every code
+- [x] **5.1 Return-code policy table** (module-level dict, one place only). For every code
   `SimBroker` or `MT5Broker` can return: `DONE` to CONFIRMED; `INVALID_STOPS`, `INVALID_FILL`,
   `REJECTED`, `NO_MONEY`, `MARKET_CLOSED` to FAILED, no retry; `REQUOTE`, `PRICE_OFF` to one retry
   only if `max_send_retries` allows, after a fresh `check`; `TIMEOUT`, `CONNECTION`, `UNKNOWN`, `None`
   to UNKNOWN. **Any code not in the table is treated as UNKNOWN (fail closed).** Test that every code
   the simulator can emit is in the table.
-- [ ] **5.2 `open_trade(...)`:** create the intent `PENDING` and commit; take the gateway lock; re-read
+- [x] **5.2 `open_trade(...)`:** create the intent `PENDING` and commit; take the gateway lock; re-read
   `stop_new` **while holding the lock** and abort (mark FAILED, reason `STOP_NEW`) if set; `check()`;
   mark `SENT`; `send_market()`; map the result via the table; on CONFIRMED write the trade row with
   `actual_risk`, code version and settings version.
-- [ ] **5.3 Unknown outcome:** wait `unknown_outcome_wait_s` (through the injected clock so tests do
+- [x] **5.3 Unknown outcome:** wait `unknown_outcome_wait_s` (through the injected clock so tests do
   not sleep), then search `positions(magic)` and `history_deals(...)` by ticket, then by intent ID
   in the comment. Found: CONFIRMED. Not found after the search: FAILED. Never resend before the search.
-- [ ] **5.4 `close_position(ticket, reason: ExitReason)`:** goes through the intent journal as a close
+- [x] **5.4 `close_position(ticket, reason: ExitReason)`:** goes through the intent journal as a close
   intent, then `gateway.close`, then `store.close_trade(...)` using the deal history for the real
   price, profit and commission.
-- [ ] **5.5 `reconcile()`:** compare `positions(magic)` with `store.open_trades()`:
+- [x] **5.5 `reconcile()`:** compare `positions(magic)` with `store.open_trades()`:
   position with no row: adopt it (write a trade row `strategy="ADOPTED"`), alert; row with no
   position: close it in the store from deal history; position with no stop-loss: set it from the
   intent record, else close it. Returns a report of actions for the caller to alert on.
-- [ ] **5.6 Commission check:** after each close compare charged commission with the table in
+- [x] **5.6 Commission check:** after each close compare charged commission with the table in
   settings; if drift exceeds 20% enqueue a warning alert.
-- [ ] **Tests (`tests/test_executor.py`) using `FaultPlan`:** `timeout_unfilled`, `timeout_filled`,
+- [x] **Tests (`tests/test_executor.py`) using `FaultPlan`:** `timeout_unfilled`, `timeout_filled`,
   `dropped_response`, `crash_after_send` (`SimulatedCrash`, then a fresh executor on the same DB),
   `invalid_stops`, `wrong_fill_mode`, `disconnect`, plus `stop_new` set while the lock is held.
   Assert after every case: **exactly one position or none, always with a stop-loss, no duplicate
@@ -274,6 +281,14 @@ All order traffic goes through this class, which uses `BrokerGateway`, `StateSto
 **Done when:** a week of replayed candles runs on `SimBroker` with no unexpected errors and no trade
 without a stop-loss.
 
+**Progress note:** evaluator, closed-bar entry processing, startup guards, and a callable management
+lane are implemented with focused simulator tests. Tests cover strategy/size/risk reason propagation,
+SDLC-ordered gate and risk precedence (including slot/cooldown before strategy evaluation),
+stored-stop cooldown counting, daily-halt stop retention, Friday flattening, and invalid
+closed-candle data without incorrectly halting management. Server-clock schedule/context wiring,
+end-to-end replayed day/week, and restart-midday acceptance are still incomplete; keep section 6
+open.
+
 ---
 
 ## 7. Unify replay with the engine (parity)
@@ -302,15 +317,20 @@ summary under `data/reports/`.
 
 ## 8. News calendar wiring (`config/news.csv`, `bot/app/news.py`)
 
-- [ ] Wire the existing calendar checks into the engine gate inputs: `news_calendar_valid` =
+- [x] Wire the existing calendar checks into the engine gate inputs: `news_calendar_valid` =
   `calendar_has_minimum_coverage(... 7 days ...)`, `news_blocked` = `is_news_blocked(...)` using
   `affected_currencies_for_symbol`. Stale calendar means no new entries (fail closed) and one alert.
-- [ ] Run `validate_news_calendar` at startup; warning alert when coverage drops under 10 days.
+- [x] Run `validate_news_calendar` at startup; warning alert when coverage drops under 10 days.
 - [ ] **Data entry is yours, not the AI's:** extend `config/news.csv` from a real economic calendar
   (central-bank decisions, NFP, CPI for USD/EUR/GBP/JPY/CHF/AUD/NZD), in UTC. The AI must not invent events.
   Add a recurring Sunday reminder to extend it.
-- [ ] **Tests:** entry blocked from 30 min before to 30 min after an event (each edge), a stale file
+- [x] **Tests:** entry blocked from 30 min before to 30 min after an event (each edge), a stale file
   blocks everything, a pair is blocked by either of its two currencies.
+
+**Progress note:** startup calendar validation, fail-closed entry gating, one-time stale-calendar
+alerting, and the under-10-day warning are implemented and covered with deterministic tests. The
+calendar contents and recurring Sunday reminder remain owner responsibilities; the existing CSV was
+not edited or treated as verified real-world data.
 
 ---
 
@@ -321,7 +341,7 @@ summary under `data/reports/`.
   ignore commands older than `command_max_age_s` (60) with a reply saying so; persist the last update
   ID via the store; backoff 1, 2, 4 s up to 30 on network failure; alert on a 409 conflict; compare the
   laptop clock with the reply's `Date` header and alert if off by more than 5 s.
-- [ ] **Alert sender:** `send_alert(severity, text)`: critical never suppressed, warnings with identical
+- [x] **Alert sender:** `send_alert(severity, text)`: critical never suppressed, warnings with identical
   text merged within 10 minutes, info as it happens; on failure write to the outbox and retry
   (`pending_alerts`, `mark_alert_sent` exist).
 - [ ] **`control.py`** commands: `/status`, `/stop_new`, `/resume`, `/close_all`.
@@ -332,12 +352,17 @@ summary under `data/reports/`.
     verify, retry every 3 s; if the market is closed, say the stop-losses remain and keep
     `close_all_pending` set. Closes only positions with the bot's magic number.
   - The control thread never imports MetaTrader; it acts through gateway, executor and store.
-- [ ] **`heartbeat.py`:** ping `HEALTHCHECK_URL` every 60 s from its own thread; never crash the bot on
+- [x] **`heartbeat.py`:** ping `HEALTHCHECK_URL` every 60 s from its own thread; never crash the bot on
   failure.
 - [ ] **Tests (`tests/test_control.py`):** fake Telegram HTTP server (or an injected fake session) plus
   `SimBroker`: stale command, wrong chat ID, command replay after restart, `/close_all` while the lock
   is held 20 s, partial failure, market closed, `/close_all` racing an in-flight entry (the send gate
   must stop it), `/resume` refused during a halt.
+
+**Progress note:** Telegram polling/filtering, cursor persistence, expiry replies, retry handling,
+409/clock-drift alerts, alert-outbox delivery, basic safety commands, and a stoppable heartbeat thread
+have focused fake-session tests. The command/heartbeat threads are not wired into a production
+`bot.main run`; `/close_all` execution/retry details and the full control failure matrix remain open.
 
 **Done when:** tests pass and a real `/status` from your phone gets an answer from the demo setup.
 
@@ -354,17 +379,22 @@ summary under `data/reports/`.
   balance (sizing returns `BELOW_MIN_LOT`).
 - [ ] Clean shutdown on Ctrl+C or a service stop: set the clean-shutdown marker, stop threads, release
   the lock, leave trades open.
-- [ ] **`tools/backup.py`:** copy the SQLite DB into `backups/` once a day (use SQLite's backup API, not
+- [x] **`tools/backup.py`:** copy the SQLite DB into `backups/` once a day (use SQLite's backup API, not
   a file copy while it is open); keep 14 days.
 - [ ] **`scripts/install_task.ps1`:** registers a Windows Task Scheduler task that starts
   `python -m bot.main run` at logon with the venv interpreter and working directory set. Document, do
   not automate silently: Windows auto-logon, sleep set to Never, active hours set to block automatic
   restarts for updates during the trading week.
-- [ ] **`docs/runbook.md`:** the manual backup route (stop the bot first, close the bot's positions in
+- [x] **`docs/runbook.md`:** the manual backup route (stop the bot first, close the bot's positions in
   the MetaTrader mobile app, check the Trade tab is empty, `/resume` once back) and the healthchecks.io
   email alert path.
 - [ ] **Tests:** second-instance lock refusal, crash-loop guard sets `stop_new`, clean shutdown leaves
   positions untouched.
+
+**Progress note:** SQLite online backup/retention, manual operations runbook, and a simulator-tested
+crash-loop guard helper exist. The guard, backup scheduling, Engine, Telegram adapter, heartbeat,
+single-instance lock, and clean-shutdown behavior are not wired into `bot.main run`; Task 10 remains
+open.
 
 **Done when:** you can start the bot, see it connect to the demo account, kill it, restart it, and watch
 it recover without duplicates.
@@ -376,7 +406,7 @@ it recover without duplicates.
 - [ ] **Automated (`tests/test_drills.py`, SimBroker only):** dropped responses, rejected stops, stale
   ticks, wrong fill mode, duplicate candle, replayed Telegram command, crash right after send. Same
   assertion each time: one protected position or none.
-- [ ] **Manual checklist** in `docs/drills.md` (you run these on the demo): restart, network
+- [x] **Manual checklist** in `docs/drills.md` (you run these on the demo): restart, network
   disconnect, MetaTrader killed, laptop sleep and wake, clock jump, process killed right after an
   order, `/close_all` with the market closed, a second instance started on purpose, stop the bot and
   confirm the missed-heartbeat alert reaches Telegram **and** email, send a test critical alert and

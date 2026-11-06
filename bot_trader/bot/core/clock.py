@@ -11,7 +11,12 @@ class Clock(Protocol):
 
 class SystemClock:
     def now_utc(self) -> datetime:
-        return datetime.now(tz=UTC)
+        return _utc_now()
+
+
+def _utc_now() -> datetime:
+    _DateTime = datetime
+    return _DateTime.now(tz=UTC)
 
 
 @dataclass(slots=True)

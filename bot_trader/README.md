@@ -18,14 +18,28 @@ Implemented so far:
 - A shared cost estimator for per-lot spread, commission, slippage and stop risk;
   cost-aware position sizing and independently tested risk checks for daily and
   monthly equity loss, daily headroom, margin use, trade/symbol limits,
-  currency exposure, and the six-candle post-stop cooldown. The risk checks are
-  not yet wired into an engine or broker-management loop.
+  currency exposure, and the six-candle post-stop cooldown. A pure candle
+  evaluator now combines these checks with configured gates and strategies.
 - Standalone fail-closed entry gates for configured sessions, weekend and
   rollover windows, news-calendar freshness/events, spread, and abnormal
-  candle range. Gate configuration/startup checks and engine integration remain
-  open.
+  candle range. Calendar validation, startup coverage alerts, and engine
+  fail-closed news integration are implemented; approved broker schedules and
+  production runtime wiring remain open.
 - A serialized broker gateway with bounded exponential retries for idempotent
   reads/checks only; state-changing order operations are not retried.
+- A broker executor that journals orders before sending, resolves uncertain
+  sends against broker positions/deals, closes from broker deal data, reconciles
+  stored and broker positions, adopts protected positions, and alerts on
+  commission drift.
+- Engine components for closed-bar entry processing, candle de-duplication,
+  startup guards, loss-limit management, Friday flattening, Strategy B's H1
+  time stop, heartbeat persistence, and a Windows single-instance lock. These
+  paths are simulator-tested but are not yet wired to a continuously running
+  command.
+- Telegram polling/control primitives, warning/critical alert outbox delivery,
+  a stoppable healthcheck pinger, and a SQLite backup utility are implemented
+  with fake-session or local-database tests. A simulator-tested crash-loop
+  guard helper is also present. These are not wired into a production process.
 - A deterministic, single-symbol candle replay with next-bar fills, spread,
   commission, slippage, conservative stop-first intrabar fills, and Strategy B's
   candle-count time stop. This remains a provisional first backtest rather than a
@@ -39,8 +53,7 @@ Implemented so far:
   commission/slippage assumptions, candle-triggered protective exits with
   stop-first same-candle handling, and deterministic timeout, lost-response,
   crash-after-send, invalid-stop, disconnect, stale-tick, wrong-fill-mode, and
-  duplicate-candle fault injection. A settings helper builds the cost map, but
-  no trading engine currently instantiates or drives the simulator.
+  duplicate-candle fault injection.
 - A thread-local SQLite state store with WAL/FULL durability, schema migration,
   baselines, safety flags, candle de-duplication, decision rows, Telegram cursor,
   an alert outbox, versioned trade audit rows, and guarded intent transitions.
@@ -50,6 +63,12 @@ Implemented so far:
   30 October 2026. They do not meet the six-year target: the cache begins after
   an unexplained six-hour EURUSD H1 gap on 2 December 2021, which remains rejected
   rather than silently filled.
+- A separate demo-only `MT5Broker` implementing account, terminal, positions,
+  history, margin, check/send, stop modification and close operations. Its
+  injected fake-API tests pass, including refusal of non-demo accounts; it has
+  not been connected to a real demo terminal or used to place orders. The
+  tick-derived broker offset still needs the manual cross-check in
+  [`../BLOCKED.md`](../BLOCKED.md).
 - Strict TOML configuration validation with a canonical settings SHA-256.
 - Environment-only runtime-secret loading, startup guards, Git version reporting,
   and rotating UTF-8 file logging helpers.
@@ -58,15 +77,13 @@ Implemented so far:
 - A simulated/system clock and broker-offset-aware time conversion helpers,
   including broker-server day/month boundaries.
 
-Still not implemented or enabled: full MT5 account/position/order operations,
-order execution, the runtime engine, restart reconciliation against broker
-positions/deals, orchestration of the full fault-injection drills, multi-symbol
-portfolio replay/statistics, integrated news/time/session gates, Telegram
-controls, heartbeat alerts, and demo smoke/failure drills. The MT5 adapter is
-read-only for the history workflow; the standard MT5 Python API does not provide
-the server UTC offset used by this project, so offset lookup requires an explicit
-provider/terminal property and has not been verified against the broker. The
-backtest is single-symbol, provisional, and not a complete parity verdict. The
+Still not implemented or enabled: production runtime wiring/loop, the full
+replayed-week acceptance test, orchestration of the complete fault-injection
+drills, multi-symbol portfolio replay/statistics, Telegram/healthcheck
+runtime delivery, and demo smoke/failure drills. The engine components are
+callable and simulator-tested, but `bot.main` does not connect `MT5Broker`
+to them; real-demo verification remains blocked, and the backtest is
+single-symbol, provisional, and not a complete parity verdict. The
 `bot.main` validation command does not connect to MT5 or place orders. This
 project must not be used for live trading.
 
@@ -81,7 +98,16 @@ remain in the authoritative SDLC record.
 
 ## News calendar validation
 
-The project includes a future-facing forex calendar under [config/news.csv](config/news.csv) and a validator at [tools/validate_news.py](tools/validate_news.py). The validator ensures the file is sorted in UTC, has no large gaps, and provides at least 7 days of coverage ahead of the current time before trading can proceed.
+The project includes [config/news.csv](config/news.csv) and a validator at
+[tools/validate_news.py](tools/validate_news.py). It checks sorting, gaps, and
+minimum future coverage. The engine validates the calendar at startup, blocks
+entries when it is stale or invalid, alerts once on stale data, and warns below
+10 days of coverage. The events in the CSV still require owner verification
+against a real economic calendar; they are not certified by these tests.
+
+Operational procedures are tracked in [docs/runbook.md](docs/runbook.md) and
+[docs/drills.md](docs/drills.md); both explicitly remain pending runtime and
+demo acceptance.
 
 ```powershell
 python tools/validate_news.py --settings settings.toml
@@ -98,13 +124,20 @@ python -m pip install --upgrade pip
 pip install -r requirements-dev.txt
 ```
 
+Create the ignored local settings file only if it does not already exist:
+
+```powershell
+if (-not (Test-Path settings.toml)) { Copy-Item settings.example.toml settings.toml }
+```
+
 The versions recorded for this environment are Python 3.14.7 and MetaTrader5
 5.0.6231. Runtime and development package versions are pinned in the requirement
 files and `pyproject.toml`.
 
-Set `expected_login` in `settings.toml` to the intended demo login before any future
-terminal integration. Do not add passwords, Telegram tokens, or healthcheck URLs to
-the settings file or source control.
+Copy `settings.example.toml` to `settings.toml`, then set the expected demo login
+locally before any future terminal integration. The real settings file is
+git-ignored. Do not add passwords, Telegram tokens, or healthcheck URLs to the
+settings file or source control; read those secrets from environment variables.
 
 ## Validate configuration
 
@@ -112,8 +145,25 @@ the settings file or source control.
 python -m bot.main --settings settings.toml validate
 ```
 
-This only validates the file. There is no terminal connection or order execution in
-the current code.
+This validates the TOML and enabled-symbol schedules. The checked-in template
+has empty `hours_utc` entries, so validation reports those missing schedules.
+The broker-derived suggestions must be reviewed on the owner's demo terminal
+before applying them. This command never connects to MT5 or places orders.
+
+Retrieve demo-terminal symbol/session data without changing settings:
+
+```powershell
+python tools/validate_symbols.py --settings settings.toml
+```
+
+Only after reviewing passing suggestions, `--write` updates `hours_utc` lines:
+
+```powershell
+python tools/validate_symbols.py --settings settings.toml --write
+```
+
+The tool has not been run against the owner terminal. Do not write schedules
+based on simulated or guessed market hours.
 
 ## Cache history and run a provisional replay
 

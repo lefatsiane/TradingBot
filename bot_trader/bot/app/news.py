@@ -79,7 +79,12 @@ def load_news_calendar(path: str | Path) -> list[NewsEvent]:
     return sorted(events, key=lambda event: event.time_utc)
 
 
-def validate_news_calendar(path: str | Path, *, min_days_covered: int = 7) -> list[NewsEvent]:
+def validate_news_calendar(
+    path: str | Path,
+    *,
+    min_days_covered: int = 7,
+    now_utc: datetime | None = None,
+) -> list[NewsEvent]:
     if min_days_covered < 1:
         raise ValueError("min_days_covered must be at least 1")
 
@@ -94,12 +99,15 @@ def validate_news_calendar(path: str | Path, *, min_days_covered: int = 7) -> li
         if gap > timedelta(days=7):
             raise ValueError("News calendar has a gap larger than one week")
 
-    now_utc = datetime.now(UTC)
-    future_events = [event for event in events if event.time_utc >= now_utc]
+    current_time = now_utc or datetime.now(UTC)
+    if current_time.tzinfo is None or current_time.utcoffset() is None:
+        raise ValueError("now_utc must be timezone-aware")
+    current_time = current_time.astimezone(UTC)
+    future_events = [event for event in events if event.time_utc >= current_time]
     if not future_events:
         raise ValueError("News calendar lacks future events")
 
-    coverage = future_events[-1].time_utc - now_utc
+    coverage = future_events[-1].time_utc - current_time
     if coverage < timedelta(days=min_days_covered):
         raise ValueError(
             "News calendar does not cover at least "
@@ -151,11 +159,18 @@ def calendar_has_minimum_coverage(
     min_days_covered: int = 7,
 ) -> bool:
     try:
-        events = validate_news_calendar(path, min_days_covered=min_days_covered)
-    except ValueError:
+        current_time = now_utc or datetime.now(UTC)
+        if current_time.tzinfo is None or current_time.utcoffset() is None:
+            return False
+        current_time = current_time.astimezone(UTC)
+        events = validate_news_calendar(
+            path,
+            min_days_covered=min_days_covered,
+            now_utc=current_time,
+        )
+    except (OSError, ValueError):
         return False
 
-    current_time = now_utc or datetime.now(UTC)
     future_events = [event for event in events if event.time_utc >= current_time]
     if not future_events:
         return False

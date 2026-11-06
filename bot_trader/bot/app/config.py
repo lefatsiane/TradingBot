@@ -3,15 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tomllib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from bot.adapters.broker import BrokerAccount
+from bot.core.gates import SessionWindow
 from bot.core.strategy_a import StrategyAParams
 from bot.core.strategy_b import StrategyBParams
 
@@ -23,6 +26,20 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+ALLOW_RISK_LIMIT_INCREASES = False
+# DECISION-PENDING: keep these approved caps until the owner decides if they may be raised.
+_APPROVED_RISK_LIMITS = {
+    "risk_per_trade_pct": 0.5,
+    "daily_loss_pct": 1.0,
+    "monthly_loss_pct": 3.0,
+    "max_net_currency_exposure_pct": 1.0,
+    "max_open_trades": 3,
+    "cost_gate_pct_of_risk": 15.0,
+    "max_margin_used_pct": 30.0,
+    "cooldown_bars_after_stop": 6,
+}
+
+
 class AccountSettings(StrictModel):
     expected_login: int = Field(ge=0)
     expected_server: str = Field(min_length=1)
@@ -32,20 +49,33 @@ class AccountSettings(StrictModel):
 
 
 class RiskSettings(StrictModel):
-    risk_per_trade_pct: float = Field(gt=0, le=0.5)
-    daily_loss_pct: float = Field(gt=0, le=1.0)
-    monthly_loss_pct: float = Field(gt=0, le=3.0)
-    max_net_currency_exposure_pct: float = Field(gt=0, le=1.0)
-    max_open_trades: int = Field(ge=1, le=3)
-    cost_gate_pct_of_risk: float = Field(gt=0, le=15)
-    max_margin_used_pct: float = Field(gt=0, le=30)
-    cooldown_bars_after_stop: int = Field(ge=0, le=6)
+    risk_per_trade_pct: float = Field(gt=0, le=100)
+    daily_loss_pct: float = Field(gt=0, le=100)
+    monthly_loss_pct: float = Field(gt=0, le=100)
+    max_net_currency_exposure_pct: float = Field(gt=0, le=100)
+    max_open_trades: int = Field(ge=1, le=100)
+    cost_gate_pct_of_risk: float = Field(gt=0, le=100)
+    max_margin_used_pct: float = Field(gt=0, le=100)
+    # DECISION-PENDING: this cooldown is measured in closed bars of its timeframe.
+    cooldown_bars_after_stop: int = Field(ge=0, le=1_000)
+
+    @model_validator(mode="after")
+    def enforce_approved_limits(self) -> RiskSettings:
+        if ALLOW_RISK_LIMIT_INCREASES:
+            return self
+        for field_name, approved_limit in _APPROVED_RISK_LIMITS.items():
+            if getattr(self, field_name) > approved_limit:
+                raise ValueError(
+                    f"{field_name} cannot exceed the approved limit {approved_limit}"
+                )
+        return self
 
 
 class TimingSettings(StrictModel):
     fast_tick_s: int = Field(ge=1, le=2)
     candle_poll_s: int = Field(ge=1, le=5)
     no_new_entries_before_weekend_close_min: int = Field(ge=120)
+    # DECISION-PENDING: confirm the Friday session end as the flatten reference.
     flatten_before_weekend_close_min: int = Field(ge=30)
     rollover_block_before_min: int = Field(ge=10)
     rollover_block_after_min: int = Field(ge=30)
@@ -73,12 +103,75 @@ class ControlSettings(StrictModel):
     command_max_age_s: int = Field(ge=60)
 
 
+_DAY_INDEX = {
+    "mon": 0,
+    "tue": 1,
+    "wed": 2,
+    "thu": 3,
+    "fri": 4,
+    "sat": 5,
+    "sun": 6,
+}
+# DECISION-PENDING: confirm this weekday-window string format with the owner.
+_HOURS_UTC_RE = re.compile(r"^(mon|tue|wed|thu|fri|sat|sun)\s+(\d{2}:\d{2})-(\d{2}:\d{2})$", re.IGNORECASE)
+
+
+def parse_sessions(hours: tuple[str, ...]) -> tuple[SessionWindow, ...]:
+    sessions: list[SessionWindow] = []
+    for raw in hours:
+        match = _HOURS_UTC_RE.fullmatch(raw.strip())
+        if match is None:
+            raise ValueError(f"Invalid hours_utc session: {raw!r}; expected 'mon 00:00-21:55'")
+        weekday_name, start_text, end_text = match.groups()
+        start = time.fromisoformat(start_text)
+        end = time.fromisoformat(end_text)
+        if start >= end:
+            raise ValueError(f"Invalid session window {raw!r}; end time must be after start time")
+        weekday = _DAY_INDEX[weekday_name.lower()]
+        sessions.append(SessionWindow(weekday=weekday, opens_utc=start, closes_utc=end))
+    return tuple(sessions)
+
+
+def schedule_validation_failures(settings: Settings) -> tuple[str, ...]:
+    failures: list[str] = []
+    for symbol, symbol_settings in settings.symbols.items():
+        if not symbol_settings.enabled:
+            continue
+        if not symbol_settings.hours_utc:
+            failures.append(f"{symbol}: hours_utc is empty")
+            continue
+        try:
+            sessions = parse_sessions(symbol_settings.hours_utc)
+        except ValueError as error:
+            failures.append(f"{symbol}: {error}")
+            continue
+        if not any(session.weekday == 4 for session in sessions):
+            failures.append(f"{symbol}: hours_utc has no Friday session")
+        for index, current in enumerate(sessions):
+            for other in sessions[index + 1 :]:
+                if (
+                    current.weekday == other.weekday
+                    and current.opens_utc < other.closes_utc
+                    and other.opens_utc < current.closes_utc
+                ):
+                    failures.append(
+                        f"{symbol}: overlapping {current.weekday} UTC sessions"
+                    )
+                    break
+    return tuple(failures)
+
+
 class SymbolSettings(StrictModel):
     enabled: bool = True
     commission_per_lot_side: float = Field(ge=0)
     slippage_points: float = Field(ge=0)
     max_spread_points: float = Field(gt=0)
     hours_utc: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_hours_utc(self) -> SymbolSettings:
+        parse_sessions(self.hours_utc)
+        return self
 
 
 class StrategyASettings(StrictModel):

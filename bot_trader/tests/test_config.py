@@ -1,19 +1,114 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import UTC, datetime, time
 from pathlib import Path
 
 import pytest
 
 from bot.adapters.broker import BrokerAccount
 from bot.app.config import (
+    RiskSettings,
     build_simulator_costs,
     load_runtime_secrets,
     load_settings,
+    parse_sessions,
+    schedule_validation_failures,
     startup_guard,
 )
 from bot.app.logging_setup import configure_logging
 from bot.app.versioning import get_version
+from bot.core.gates import SessionWindow, next_weekend_close_utc
+
+
+@pytest.mark.parametrize(
+    ("field", "raised_value"),
+    (
+        ("risk_per_trade_pct", 0.51),
+        ("daily_loss_pct", 1.01),
+        ("monthly_loss_pct", 3.01),
+        ("max_net_currency_exposure_pct", 1.01),
+        ("max_open_trades", 4),
+        ("cost_gate_pct_of_risk", 15.01),
+        ("max_margin_used_pct", 30.01),
+        ("cooldown_bars_after_stop", 7),
+    ),
+)
+def test_risk_settings_reject_unapproved_limit_increases(
+    field: str, raised_value: float
+) -> None:
+    approved_values = {
+        "risk_per_trade_pct": 0.5,
+        "daily_loss_pct": 1.0,
+        "monthly_loss_pct": 3.0,
+        "max_net_currency_exposure_pct": 1.0,
+        "max_open_trades": 3,
+        "cost_gate_pct_of_risk": 15.0,
+        "max_margin_used_pct": 30.0,
+        "cooldown_bars_after_stop": 6,
+    }
+
+    with pytest.raises(ValueError, match=f"{field} cannot exceed the approved limit"):
+        RiskSettings.model_validate({**approved_values, field: raised_value})
+
+
+def test_parse_sessions_accepts_valid_catalog_windows() -> None:
+    sessions = parse_sessions(("mon 00:00-21:55", "fri 00:00-21:55"))
+
+    assert sessions == (
+        SessionWindow(0, time(0, 0), time(21, 55)),
+        SessionWindow(4, time(0, 0), time(21, 55)),
+    )
+
+
+def test_enabled_symbols_require_non_overlapping_friday_schedules() -> None:
+    source = Path(__file__).parents[1] / "settings.toml"
+    settings, _ = load_settings(source)
+    failures = schedule_validation_failures(settings)
+    assert len(failures) == 6
+    assert all("hours_utc is empty" in failure for failure in failures)
+    assert not any("XAUUSD" in failure for failure in failures)
+
+    symbols = {
+        symbol: symbol_settings.model_copy(
+            update={"hours_utc": ("mon 00:00-21:55", "fri 00:00-21:55")}
+        )
+        for symbol, symbol_settings in settings.symbols.items()
+    }
+    valid = settings.model_copy(update={"symbols": symbols})
+    assert schedule_validation_failures(valid) == ()
+
+    eurusd = symbols["EURUSD"].model_copy(
+        update={
+            "hours_utc": (
+                "mon 00:00-12:00",
+                "mon 11:00-15:00",
+            )
+        }
+    )
+    invalid = settings.model_copy(update={"symbols": {"EURUSD": eurusd}})
+    issues = schedule_validation_failures(invalid)
+    assert any("no Friday session" in issue for issue in issues)
+    assert any("overlapping" in issue for issue in issues)
+
+
+def test_next_weekend_close_utc_finds_the_next_friday_close() -> None:
+    sessions = (
+        SessionWindow(1, time(8, 0), time(17, 0)),
+        SessionWindow(4, time(8, 0), time(23, 0)),
+    )
+    now = datetime(2026, 10, 27, 11, 0, tzinfo=UTC)
+
+    assert next_weekend_close_utc(now, sessions) == datetime(2026, 10, 30, 23, 0, tzinfo=UTC)
+
+
+def test_next_weekend_close_utc_moves_to_following_friday_after_close() -> None:
+    sessions = (SessionWindow(4, time(8, 0), time(17, 0)),)
+    now = datetime(2026, 10, 30, 18, 0, tzinfo=UTC)
+
+    assert next_weekend_close_utc(now, sessions) == datetime(
+        2026, 11, 6, 17, 0, tzinfo=UTC
+    )
 
 
 def test_runtime_secrets_come_only_from_environment() -> None:

@@ -67,6 +67,7 @@ class BrokerDeal:
     commission: float
     magic_number: int
     comment: str
+    is_entry: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +99,8 @@ class Broker(Protocol):
     def terminal_info(self) -> BrokerTerminalInfo: ...
 
     def symbol_info(self, symbol: str) -> SymbolSpec: ...
+
+    def symbol_sessions_utc(self, symbol: str) -> tuple[str, ...]: ...
 
     def candles(self, symbol: str, timeframe: str) -> tuple[Candle, ...]: ...
 

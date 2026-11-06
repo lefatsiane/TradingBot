@@ -71,6 +71,11 @@ def next_trading_day_boundary_utc(utc_time: datetime, server_offset_hours: int) 
     return _server_midnight_to_utc(datetime.combine(server_date, time.min))
 
 
+def next_rollover_utc(utc_time: datetime, server_offset_hours: int) -> datetime:
+    """Return the next UTC instant of broker-server midnight."""
+    return next_trading_day_boundary_utc(utc_time, server_offset_hours)
+
+
 def next_month_boundary_utc(utc_time: datetime, server_offset_hours: int) -> datetime:
     """Return the next server-midnight month boundary."""
     at_utc = _require_utc(utc_time)

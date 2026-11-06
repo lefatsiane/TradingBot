@@ -45,6 +45,18 @@ class ReasonCode(StrEnum):
     SLOT_TAKEN = "SLOT_TAKEN"
     MAX_TRADES = "MAX_TRADES"
     CURRENCY_EXPOSURE = "CURRENCY_EXPOSURE"
+    ENTRY_ALLOWED = "ENTRY_ALLOWED"
+
+
+class ExitReason(StrEnum):
+    STOP_LOSS = "STOP_LOSS"
+    TAKE_PROFIT = "TAKE_PROFIT"
+    TIME_STOP = "TIME_STOP"
+    WEEKEND_FLATTEN = "WEEKEND_FLATTEN"
+    MONTHLY_CAP = "MONTHLY_CAP"
+    CLOSE_ALL = "CLOSE_ALL"
+    MANUAL = "MANUAL"
+    UNKNOWN = "UNKNOWN"
 
 
 @dataclass(frozen=True, slots=True)
