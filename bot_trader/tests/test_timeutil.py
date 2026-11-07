@@ -4,10 +4,12 @@ import pytest
 
 from bot.core.timeutil import (
     broker_to_utc,
+    broker_wall_time_to_utc,
     month_start_utc,
     next_month_boundary_utc,
     next_rollover_utc,
     next_trading_day_boundary_utc,
+    rounded_server_offset_from_tick,
     trading_day_start_utc,
 )
 
@@ -23,6 +25,38 @@ from bot.core.timeutil import (
 def test_broker_time_conversion_uses_reported_offset(utc_time: datetime, offset: int) -> None:
     server_epoch = int((utc_time + timedelta(hours=offset)).timestamp())
     assert broker_to_utc(server_epoch, offset) == utc_time
+
+
+@pytest.mark.parametrize(
+    ("utc_time", "offset"),
+    [
+        (datetime(2026, 10, 25, 12, tzinfo=UTC), 3),
+        (datetime(2026, 11, 1, 12, tzinfo=UTC), 2),
+        (datetime(2027, 3, 14, 12, tzinfo=UTC), 3),
+    ],
+)
+def test_broker_wall_time_conversion_uses_new_york_dst_rule(
+    utc_time: datetime, offset: int
+) -> None:
+    server_epoch = int((utc_time + timedelta(hours=offset)).timestamp())
+
+    assert broker_wall_time_to_utc(server_epoch) == utc_time
+
+
+def test_broker_wall_time_conversion_rejects_ambiguous_dst_wall_time() -> None:
+    ambiguous_server_epoch = int(
+        datetime(2026, 11, 1, 8, 30, tzinfo=UTC).timestamp()
+    )
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        broker_wall_time_to_utc(ambiguous_server_epoch)
+
+
+def test_tick_offset_rounds_to_nearest_half_hour() -> None:
+    utc_time = datetime(2026, 1, 5, 13, 40, tzinfo=UTC)
+    tick_time_msc = int((utc_time.timestamp() + 2.26 * 60 * 60) * 1000)
+
+    assert rounded_server_offset_from_tick(tick_time_msc, utc_time) == 2.5
 
 
 def test_trading_day_boundary_does_not_split_when_offset_changes_on_dst_day() -> None:

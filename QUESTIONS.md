@@ -1,26 +1,31 @@
-# Questions requiring the owner's decision
+# Confirmed decisions and remaining owner actions
 
-1. **MT5 server-offset verification (task 3.3):** Is deriving the broker offset from a fresh EURUSD
-   server timestamp acceptable? The adapter follows the task's tick-derived method and checks
-   freshness/expected offset, but it still needs a weekday visual cross-check against the MT5 server
-   clock before the inferred value is relied on.
-2. **`hours_utc` format (task 1.1):** The implementation uses the proposed weekday-window strings
-   such as `"mon 00:00-21:55"`. Please confirm this format before applying any broker-derived
-   schedules to `settings.toml`.
-3. **Friday flatten timing (task 6c):** The engine derives each symbol's Friday close from the
-   final Friday `hours_utc` session and subtracts `flatten_before_weekend_close_min`. Please confirm
-   that this is the intended close reference.
-4. **Strategy A review (task 14):** The 1 November 2026 run had profit factor 0.935. Review
-   `strategy_a.py` for implementation bugs before any counted backtests; do not tune parameters to
-   improve this result.
-5. **Cooldown unit:** The implementation interprets cooldown as a count of closed bars on the
-   active strategy timeframe. Confirm that H1/H4 cooldown counts, rather than elapsed time, are
-   intended.
-6. **Realized-profit headroom:** May realized profits restore daily risk headroom? Until confirmed,
-   realized profits do not increase the approved daily headroom; realized losses still reduce it.
-7. **Risk-limit increases:** May any approved risk limits be raised above their current values?
-   Until confirmed, configuration validation rejects increases to the approved caps.
+## Confirmed decisions
 
-The prompt's hard rules refer to six pending decisions, but its current section 14 lists only four
-items and includes the separate Strategy A review. The three decision questions above fill the
-missing cooldown, realized-profit, and risk-limit items.
+- Strategy A requires 300 closed candles before proposing an entry.
+- Convert broker wall-clock timestamps using the deterministic New York DST rule plus seven hours:
+  UTC+2 in US winter and UTC+3 in US summer. Tick samples are sanity checks only. Sample advancing
+  ticks, round their server-time offset to the nearest half-hour, and compare with the rule; on a
+  mismatch, set `stop_new` and send a critical alert. The owner will visually cross-check the MT5
+  server clock on an open-market weekday.
+- Sessions use weekday strings such as `"mon 00:00-21:55"` in UTC, with exclusive end times. Split
+  midnight-crossing schedules into daily windows. `24:00` is valid only as an end time and means the
+  exclusive midnight boundary on the following day. Tag each reviewed schedule as `US winter` or
+  `US summer`; shift it automatically by the New York-rule offset difference in the opposite season,
+  including weekday rollover.
+- Friday flatten is based on the reviewed session's close minus
+  `flatten_before_weekend_close_min`. The no-entry window starts earlier; if flattening does not
+  complete, alert, retry, and block new entries until bot positions are flat.
+- Cooldown is measured in closed bars on the active timeframe. Realized profits do not restore daily
+  risk headroom. Approved risk caps remain unchanged.
+
+## Remaining owner actions
+
+- Run `validate_symbols.py` on the owner's demo terminal and review the broker-derived schedules
+  before applying them to `bot_trader/settings.toml`. Keep enabled-symbol schedules empty until then;
+  do not use the unverified `bot_trader/config/sessions.toml` example.
+- Supply and verify a real economic-calendar source/path and UTC events. Do not treat the checked-in
+  sample calendar as acceptance data.
+- Complete the MT5 demo-terminal clock cross-check and remaining demo runtime/restart/control drills.
+- Run random-entry and sensitivity acceptance only after the schedules and real news data are
+  available; no live orders or unreviewed schedule assumptions are permitted.

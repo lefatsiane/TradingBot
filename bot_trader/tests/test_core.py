@@ -112,7 +112,7 @@ def test_config_template_validates_without_terminal_connection() -> None:
     assert settings.account.allow_live is False
     assert settings.symbols["XAUUSD"].enabled is False
     strategy_params = settings.strategy_a.to_params()
-    assert strategy_params.min_candles == 600
+    assert strategy_params.min_candles == 300
     assert strategy_params.window_candles == 1_000
     assert len(version) == 64
 
@@ -149,9 +149,9 @@ def test_strategies_return_warmup_for_short_history() -> None:
 
 
 @pytest.mark.parametrize("side", [Side.LONG, Side.SHORT])
-def test_strategy_a_warmup_boundary_is_600_closed_candles(side: Side) -> None:
-    assert propose_a(trending_fixture(side, 599), STRATEGY_A_PARAMS).reason is ReasonCode.WARMUP
-    assert propose_a(trending_fixture(side, 600), STRATEGY_A_PARAMS).proposal is not None
+def test_strategy_a_warmup_boundary_is_300_closed_candles(side: Side) -> None:
+    assert propose_a(trending_fixture(side, 299), STRATEGY_A_PARAMS).reason is ReasonCode.WARMUP
+    assert propose_a(trending_fixture(side, 300), STRATEGY_A_PARAMS).proposal is not None
 
 
 def test_strategy_a_uses_exactly_its_last_1000_candles() -> None:
@@ -163,15 +163,15 @@ def test_strategy_a_uses_exactly_its_last_1000_candles() -> None:
 
 
 def test_strategy_a_uses_explicit_warmup_and_target_parameters() -> None:
-    candles = trending_fixture(Side.LONG, 600)
+    candles = trending_fixture(Side.LONG, 300)
     params = replace(
         STRATEGY_A_PARAMS,
-        min_candles=601,
+        min_candles=301,
         take_profit_r=2.4,
     )
     assert propose_a(candles, params).reason is ReasonCode.WARMUP
 
-    ready_params = replace(params, min_candles=600)
+    ready_params = replace(params, min_candles=300)
     result = propose_a(candles, ready_params)
 
     assert result.proposal is not None

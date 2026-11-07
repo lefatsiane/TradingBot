@@ -26,6 +26,7 @@ from bot.app.config import (
 from bot.app.data import DataQualityError, Timeframe
 from bot.app.engine import Engine
 from bot.app.executor import Executor
+from bot.app.news import NewsEvent
 from bot.app.random_control import RandomEntryKey
 from bot.core.clock import SimClock
 from bot.core.strategy_a import StrategyAParams
@@ -43,6 +44,10 @@ class ReplayRunResult:
     strategy_mode: StrategyMode
     strategy_parameters: dict[str, dict[str, int | float]]
     random_entry_targets: dict[str, int] | None
+    news_events: tuple[NewsEvent, ...]
+    news_calendar_valid: bool | None
+    news_block_before_min: int
+    news_block_after_min: int
     starting_equity: float
     ending_equity: float
     cost_multiplier: float
@@ -213,6 +218,8 @@ def run_replay(
     equity_curve = [EquityPoint(first_time, simulated_account.equity)]
     try:
         engine.start()
+        replay_news_events = engine.news_events
+        replay_news_calendar_valid = engine.news_calendar_valid
         events = sorted(
             {
                 candle.time
@@ -281,6 +288,10 @@ def run_replay(
                 if random_entry_targets is not None
                 else None
             ),
+            news_events=replay_news_events,
+            news_calendar_valid=replay_news_calendar_valid,
+            news_block_before_min=settings.news.block_before_min,
+            news_block_after_min=settings.news.block_after_min,
             starting_equity=starting_equity,
             ending_equity=final_account.equity,
             cost_multiplier=cost_multiplier,
@@ -378,6 +389,18 @@ def write_replay_report(
         "strategy_parameters": result.strategy_parameters,
         "random_entry_control": result.random_entry_targets is not None,
         "random_entry_targets": result.random_entry_targets,
+        "news_calendar_valid": result.news_calendar_valid,
+        "news_block_before_min": result.news_block_before_min,
+        "news_block_after_min": result.news_block_after_min,
+        "news_events": [
+            {
+                "time_utc": event.time_utc.isoformat(),
+                "currency": event.currency,
+                "impact": event.impact,
+                "title": event.title,
+            }
+            for event in result.news_events
+        ],
         "news_enabled": result.news_enabled,
         "final_run": result.final_run,
         "cost_multiplier": result.cost_multiplier,

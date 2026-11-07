@@ -1,0 +1,9 @@
+season = "US winter"   # broker UTC+2, valid from 1 Nov 2026 to 7 Mar 2027
+symbols: EURUSD GBPUSD USDJPY USDCHF AUDUSD NZDUSD   (identical windows, UTC)
+
+sun 22:01-24:00
+mon 00:00-21:59   mon 22:01-24:00
+tue 00:00-21:59   tue 22:01-24:00
+wed 00:00-21:59   wed 22:01-24:00
+thu 00:00-21:59   thu 22:01-24:00
+fri 00:00-21:57

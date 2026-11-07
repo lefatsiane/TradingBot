@@ -42,7 +42,7 @@ def build_random_entry_schedule(
             candles = histories.get((symbol, timeframe), ())
             candidates.extend(
                 (symbol, timeframe, candle.time)
-                for candle in candles[minimum_candles - 1 :]
+                for candle in candles[minimum_candles - 1 : -1]
             )
         count = min(len(candidates), target * candidates_per_trade)
         if count == 0:

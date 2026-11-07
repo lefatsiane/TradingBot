@@ -13,10 +13,14 @@ def next_weekend_close_utc(now_utc: datetime, sessions: Iterable[SessionWindow])
     current = _as_utc(now_utc, "now_utc")
     candidates: list[datetime] = []
     for session in sessions:
-        if session.weekday != 4:
+        crosses_midnight = session.full_day or session.closes_utc < session.opens_utc
+        closing_weekday = (session.weekday + int(crosses_midnight)) % 7
+        if session.weekday != 4 and closing_weekday != 4:
             continue
-        friday_date = current.date() + timedelta(days=(4 - current.weekday()) % 7)
-        closes = datetime.combine(friday_date, session.closes_utc, tzinfo=UTC)
+        closing_date = current.date() + timedelta(
+            days=(closing_weekday - current.weekday()) % 7
+        )
+        closes = datetime.combine(closing_date, session.closes_utc, tzinfo=UTC)
         if closes < current:
             closes += timedelta(days=7)
         if closes >= current:
@@ -31,14 +35,17 @@ class SessionWindow:
     weekday: int
     opens_utc: time
     closes_utc: time
+    full_day: bool = False
 
     def __post_init__(self) -> None:
         if not 0 <= self.weekday <= 6:
             raise ValueError("weekday must be in range 0..6")
         if self.opens_utc.tzinfo is not None or self.closes_utc.tzinfo is not None:
             raise ValueError("Session times must be naive UTC wall-clock times")
-        if self.opens_utc == self.closes_utc:
+        if self.opens_utc == self.closes_utc and not self.full_day:
             raise ValueError("Session open and close times cannot be equal")
+        if self.full_day and self.opens_utc != self.closes_utc:
+            raise ValueError("Full-day sessions must have matching open and close times")
 
 
 @dataclass(frozen=True, slots=True)

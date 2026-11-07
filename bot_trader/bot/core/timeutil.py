@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import math
 import warnings
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 NEW_YORK = ZoneInfo("America/New_York")
+NEW_YORK_SERVER_OFFSET_HOURS = 7
 
 
 def _require_utc(value: datetime) -> datetime:
@@ -14,9 +16,43 @@ def _require_utc(value: datetime) -> datetime:
 
 
 def expected_new_york_offset(utc_time: datetime) -> int:
-    """Return the expected New York server offset for the given UTC instant."""
+    """Return New York local time plus seven hours for the given UTC instant."""
     localized = _require_utc(utc_time).astimezone(NEW_YORK)
-    return 3 if localized.dst() else 2
+    offset = localized.utcoffset()
+    if offset is None:
+        raise ValueError("New York UTC offset is unavailable")
+    return int(offset.total_seconds() // 3_600) + NEW_YORK_SERVER_OFFSET_HOURS
+
+
+def rounded_server_offset_from_tick(tick_time_msc: int, utc_time: datetime) -> float:
+    if isinstance(tick_time_msc, bool) or not isinstance(tick_time_msc, int) or tick_time_msc <= 0:
+        raise ValueError("tick_time_msc must be a positive integer")
+    now = _require_utc(utc_time)
+    offset_hours = tick_time_msc / 1_000 - now.timestamp()
+    return math.floor(offset_hours / 1_800 + 0.5) / 2
+
+
+def broker_wall_time_to_utc(server_epoch: float) -> datetime:
+    """Convert MT5's server wall-clock epoch using the New York DST rule."""
+    if (
+        isinstance(server_epoch, bool)
+        or not isinstance(server_epoch, (int, float))
+        or not math.isfinite(server_epoch)
+    ):
+        raise ValueError("server_epoch must be a finite number")
+    server_wall_time = datetime.fromtimestamp(server_epoch, tz=UTC).replace(tzinfo=None)
+    candidates = []
+    for offset_hours in (2, 3):
+        candidate = (
+            server_wall_time - timedelta(hours=offset_hours)
+        ).replace(tzinfo=UTC)
+        if expected_new_york_offset(candidate) == offset_hours:
+            candidates.append(candidate)
+    if not candidates:
+        raise ValueError("Broker wall time does not match the New York DST rule")
+    if len(candidates) > 1:
+        raise ValueError("Broker wall time is ambiguous during a New York DST transition")
+    return candidates[0]
 
 
 def check_broker_offset(broker_offset_hours: int, utc_time: datetime) -> int:

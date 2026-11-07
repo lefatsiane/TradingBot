@@ -74,6 +74,7 @@ def test_random_schedule_is_reproducible_and_matches_requested_candidate_counts(
     assert first == repeated
     assert len(first) == 2
     assert {key[1] for key in first} <= {"H1", "H4"}
+    assert all(key[2] != histories[(key[0], key[1])][-1].time for key in first)
     assert set(first.values()) <= {Side.LONG, Side.SHORT}
 
 
@@ -85,9 +86,24 @@ def test_random_schedule_rejects_missing_candidate_history() -> None:
 def test_random_control_runs_reproducibly_and_reports_expectancy(tmp_path, monkeypatch) -> None:
     trades = (
         SimpleNamespace(
+            ticket="position-1",
             symbol="EURUSD",
             closed_at_utc="2024-01-02T00:00:00+00:00",
-            result_r=0.5,
+            actual_risk=100.0,
+        ),
+    )
+    deals = (
+        SimpleNamespace(
+            position_ticket="position-1",
+            is_entry=True,
+            profit=0.0,
+            commission=5.0,
+        ),
+        SimpleNamespace(
+            position_ticket="position-1",
+            is_entry=False,
+            profit=60.0,
+            commission=5.0,
         ),
     )
     run_calls = []
@@ -95,7 +111,7 @@ def test_random_control_runs_reproducibly_and_reports_expectancy(tmp_path, monke
     def fake_run_replay(*positional_args, **kwargs):
         assert len(positional_args) == 3
         run_calls.append(kwargs)
-        return SimpleNamespace(trades=trades)
+        return SimpleNamespace(trades=trades, deals=deals)
 
     monkeypatch.setattr(random_control, "run_replay", fake_run_replay)
     history = _candles(650)
@@ -120,5 +136,6 @@ def test_random_control_runs_reproducibly_and_reports_expectancy(tmp_path, monke
     assert strategy_result["completed_runs"] == 2
     assert strategy_result["baseline_expectancy_r"] == pytest.approx(0.5)
     assert strategy_result["random_expectancy_95th_percentile_r"] == pytest.approx(0.5)
-    assert strategy_result["status"] == "FAIL"
+    assert strategy_result["status"] == "INCONCLUSIVE"
+    assert strategy_result["acceptance_run_count_met"] is False
     assert len(run_calls) == 3

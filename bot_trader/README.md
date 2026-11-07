@@ -13,7 +13,7 @@ traceability record are in the [Trading Bot Full SDLC Record](../Trading%20Bot%2
 Implemented so far:
 
 - Pure EMA/ATR, Bollinger, RSI, and ADX indicator functions.
-- Pure, parameter-driven Strategy A (H1/H4, 600-candle warm-up, 1,000-candle
+- Pure, parameter-driven Strategy A (H1/H4, 300-candle warm-up, 1,000-candle
   working window) and Strategy B (H1 only) proposal logic.
 - A shared cost estimator for per-lot spread, commission, slippage and stop risk;
   cost-aware position sizing and independently tested risk checks for daily and
@@ -69,7 +69,7 @@ Implemented so far:
   history, margin, check/send, stop modification and close operations. Its
   injected fake-API tests pass, including refusal of non-demo accounts; it has
   not been connected to a real demo terminal or used to place orders. The
-  tick-derived broker offset still needs the manual cross-check in
+  New York-plus-seven-hour broker-clock rule still needs the manual cross-check in
   [`../BLOCKED.md`](../BLOCKED.md).
 - Strict TOML configuration validation with a canonical settings SHA-256.
 - Environment-only runtime-secret loading, startup guards, Git version reporting,
@@ -87,8 +87,9 @@ it has not been run against a real terminal and is not approved for unattended
 operation. The separate `validate` command never connects to MT5 or places
 orders. This project must not be used for live trading.
 
-Strategy A uses a 600-candle warm-up. The 1 November 2026 H1 EURUSD checkpoint
-ran to completion and saved its report: 401 trades, net profit -$226.86, win
+Strategy A currently uses a 300-candle warm-up. The 1 November 2026 H1 EURUSD
+checkpoint was run with the previous 600-candle warm-up and saved its report:
+401 trades, net profit -$226.86, win
 rate 33.92%, profit factor 0.935, and maximum drawdown $354.96 (11.55%). It
 excluded 6,191 recent bars and ended with no open position. This satisfies the
 checkpoint's run-and-save criterion only; the result is negative and does not
@@ -175,14 +176,19 @@ $env:MT5_PASSWORD = "<demo password>"
 python tools/validate_symbols.py --settings settings.toml
 ```
 
-Only after reviewing passing suggestions, `--write` updates `hours_utc` lines:
+Only after reviewing passing suggestions, `--write` updates both `hours_utc` and
+`hours_utc_season`. The season records whether the broker-derived UTC windows were
+reviewed during US winter or US summer; runtime automatically shifts them by the
+New York-rule offset difference in the other season, including weekday rollover.
 
 ```powershell
 python tools/validate_symbols.py --settings settings.toml --write
 ```
 
 The tool has not been run against the owner terminal. Do not write schedules
-based on simulated or guessed market hours.
+based on simulated or guessed market hours. Session end times are exclusive;
+`24:00` is accepted only as an end time and means midnight at the start of the
+next day. A session crossing midnight must otherwise be split across weekdays.
 
 ## Cache history and run a provisional replay
 
@@ -212,7 +218,8 @@ the code version and prevents a second final run. The replay uses only
 checkpoint result is not a strategy approval.
 
 Analyze a replay report and write its drawdown, 10,000-resample calendar-week
-confidence interval, and scorecard:
+confidence interval, variant count, news-gate counts, and scheduled-news trade
+overlap outcomes to its scorecard:
 
 ```powershell
 python tools/stats.py data/reports/<run-directory>
@@ -259,6 +266,12 @@ This writes one replay report per valid +/-20 percent parameter variant, a
 than silently skipped. The engine's 1,000-candle input cap still applies.
 Replay `portfolio_breakdown.csv` reports strategy,
 symbol/timeframe, and overall combined totals.
+
+News overlap metrics are available only when the replay used an enabled,
+validated calendar snapshot; otherwise those outcome fields are `UNAVAILABLE`.
+News-gate-blocked decision counts remain available from the replay decisions
+when that CSV exists. Variant count comes from the adjacent
+`data/reports/variants.json` ledger.
 
 Record a unique strategy variant before running it so the attempt count stays
 auditable:

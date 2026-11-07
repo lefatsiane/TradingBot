@@ -8,9 +8,15 @@ import os
 import random
 import sys
 from collections import defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from bot.app.news import affected_currencies_for_symbol
 
 BOOTSTRAP_RESAMPLES = 10_000
 BOOTSTRAP_SEED = 0
@@ -138,6 +144,11 @@ def analyze_report(
     starting_equity = _finite_number(summary, "starting_equity")
     points = _read_equity_curve(directory / "equity_curve.csv")
     metrics = calculate_statistics(points, starting_equity)
+    news_metrics = _news_metrics(
+        directory,
+        summary,
+        report_end_utc=points[-1][0],
+    )
     cost_drift_pct = None
     if cost_stress_report is not None:
         stress_dir = Path(cost_stress_report)
@@ -157,7 +168,9 @@ def analyze_report(
         },
         "code_version": summary.get("code_version", "unknown"),
         "settings_version": summary.get("settings_version", "unknown"),
+        "variant_count": _variant_count(directory.parent / "variants.json"),
         "metrics": metrics,
+        "news_metrics": news_metrics,
         "scorecard": build_scorecard(metrics, cost_drift_pct=cost_drift_pct),
     }
 
@@ -281,6 +294,159 @@ def _read_equity_curve(path: Path) -> list[tuple[datetime, float]]:
     if not points:
         raise ValueError("equity_curve.csv contains no data")
     return points
+
+
+def _variant_count(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    variants = payload.get("variants") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or not isinstance(variants, list)
+        or not all(
+            isinstance(item, dict) and isinstance(item.get("variant_id"), str)
+            for item in variants
+        )
+    ):
+        raise ValueError(f"Variant ledger has an invalid schema: {path}")
+    return len(variants)
+
+
+def _news_metrics(
+    report_dir: Path,
+    summary: dict[str, Any],
+    *,
+    report_end_utc: datetime,
+) -> dict[str, Any]:
+    decisions_path = report_dir / "decisions.csv"
+    if decisions_path.exists():
+        with decisions_path.open(newline="", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            if not {"time_utc", "reason"}.issubset(reader.fieldnames or ()):
+                raise ValueError("decisions.csv must contain time_utc and reason columns")
+            blocked_signals = sum(row.get("reason") == "NEWS_WINDOW" for row in reader)
+    else:
+        blocked_signals = None
+
+    events = summary.get("news_events")
+    news_enabled = summary.get("news_enabled")
+    calendar_valid = summary.get("news_calendar_valid")
+    if (
+        news_enabled is not True
+        or calendar_valid is not True
+        or not isinstance(events, list)
+    ):
+        return {
+            "status": "UNAVAILABLE",
+            "news_gate_blocked_signals": blocked_signals,
+            "event_count": None,
+            "overlapping_trade_count": None,
+            "overlapping_closed_trade_count": None,
+            "overlapping_open_trade_count": None,
+            "overlapping_net_profit": None,
+            "overlapping_winning_trades": None,
+            "overlapping_losing_trades": None,
+        }
+
+    before_min = _summary_int(summary, "news_block_before_min")
+    after_min = _summary_int(summary, "news_block_after_min")
+    normalized_events = []
+    for event in events:
+        if not isinstance(event, dict):
+            raise TypeError("summary news_events entries must be objects")
+        try:
+            event_time = datetime.fromisoformat(event["time_utc"])
+            currency = event["currency"]
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("summary contains an invalid news event") from error
+        if event_time.tzinfo is None or event_time.utcoffset() is None:
+            raise ValueError("summary news event timestamps must be timezone-aware")
+        if not isinstance(currency, str):
+            raise TypeError("summary news event currency must be a string")
+        normalized_events.append((event_time, currency.upper()))
+
+    trades_path = report_dir / "trades.csv"
+    if not trades_path.exists():
+        return {
+            "status": "UNAVAILABLE",
+            "news_gate_blocked_signals": blocked_signals,
+            "event_count": len(events),
+            "overlapping_trade_count": None,
+            "overlapping_closed_trade_count": None,
+            "overlapping_open_trade_count": None,
+            "overlapping_net_profit": None,
+            "overlapping_winning_trades": None,
+            "overlapping_losing_trades": None,
+        }
+
+    overlapping: list[tuple[bool, float]] = []
+    with trades_path.open(newline="", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        required = {
+            "ticket",
+            "symbol",
+            "entry_time_utc",
+            "exit_time_utc",
+            "profit",
+            "commission",
+            "open",
+        }
+        if not required.issubset(reader.fieldnames or ()):
+            raise ValueError("trades.csv is missing news-analysis columns")
+        for row in reader:
+            if not row.get("entry_time_utc"):
+                continue
+            entry_time = _parse_aware_timestamp(row["entry_time_utc"])
+            is_open = row["open"].strip().lower() == "true"
+            exit_time = (
+                report_end_utc
+                if is_open
+                else _parse_aware_timestamp(row["exit_time_utc"])
+            )
+            currencies = set(affected_currencies_for_symbol(row["symbol"]))
+            has_overlap = any(
+                currency in currencies
+                and event_time - timedelta(minutes=before_min) <= exit_time
+                and event_time + timedelta(minutes=after_min) >= entry_time
+                for event_time, currency in normalized_events
+            )
+            if has_overlap:
+                net_profit = float(row["profit"]) - float(row["commission"])
+                if not math.isfinite(net_profit):
+                    raise ValueError("trade P&L values must be finite")
+                overlapping.append((is_open, net_profit))
+
+    closed = [profit for is_open, profit in overlapping if not is_open]
+    return {
+        "status": "AVAILABLE",
+        "news_gate_blocked_signals": blocked_signals,
+        "event_count": len(events),
+        "overlapping_trade_count": len(overlapping),
+        "overlapping_closed_trade_count": len(closed),
+        "overlapping_open_trade_count": len(overlapping) - len(closed),
+        "overlapping_net_profit": sum(profit for _, profit in overlapping),
+        "overlapping_winning_trades": sum(profit > 0 for profit in closed),
+        "overlapping_losing_trades": sum(profit < 0 for profit in closed),
+    }
+
+
+def _summary_int(summary: dict[str, Any], key: str) -> int:
+    value = summary.get(key)
+    if not isinstance(value, int) or value < 0:
+        raise ValueError(f"summary {key} must be a non-negative integer")
+    return value
+
+
+def _parse_aware_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"Invalid timestamp: {value!r}") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("Trade timestamps must be timezone-aware")
+    return parsed.astimezone(UTC)
 
 
 def _period_lows(

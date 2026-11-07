@@ -105,7 +105,7 @@ stop_buffer_atr = 0.25
 min_stop_atr = 1.0
 max_stop_atr = 3.0
 take_profit_r = 2.0
-min_candles = 600
+min_candles = 300
 window_candles = 1000
 cooldown_bars_after_stop = 6
 

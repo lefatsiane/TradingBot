@@ -95,6 +95,7 @@ def test_validate_symbol_passes_with_six_months_of_simulated_history() -> None:
     assert report.issues == ()
     assert report.history_bars >= 183 * 24
     assert report.suggested_hours_utc == SESSIONS
+    assert report.suggested_hours_utc_season == "US summer"
 
 
 def test_oversized_minimum_lot_reports_below_min_lot_without_enabling_symbol() -> None:
@@ -159,7 +160,7 @@ def test_write_hours_utc_changes_only_symbol_hours(
     with settings_path.open("w", encoding="utf-8", newline="") as settings_file:
         settings_file.write(original)
 
-    write_hours_utc(settings_path, {SYMBOL: SESSIONS})
+    write_hours_utc(settings_path, {SYMBOL: SESSIONS}, "US summer")
 
     updated = settings_path.read_bytes().decode("utf-8")
     assert line_ending in updated
@@ -167,11 +168,23 @@ def test_write_hours_utc_changes_only_symbol_hours(
         assert "\r\n" not in updated
     else:
         assert "\n" not in updated.replace("\r\n", "")
-    assert [line for line in updated.splitlines() if not line.startswith("hours_utc")] == [
-        line for line in original.splitlines() if not line.startswith("hours_utc")
+    assert [
+        line
+        for line in updated.splitlines()
+        if not line.startswith(("hours_utc", "hours_utc_season"))
+    ] == [
+        line
+        for line in original.splitlines()
+        if not line.startswith(("hours_utc", "hours_utc_season"))
     ]
     assert 'hours_utc = ["mon 00:00-21:55"' in updated
+    assert 'hours_utc_season = "US summer"' in updated
     parsed = tomllib.loads(updated)
     assert tuple(parsed["symbols"][SYMBOL]["hours_utc"]) == SESSIONS
+    assert parsed["symbols"][SYMBOL]["hours_utc_season"] == "US summer"
     assert parsed["risk"]["risk_per_trade_pct"] == 0.5
     assert parsed["strategy_a"]["ema_fast"] == 20
+
+    write_hours_utc(settings_path, {SYMBOL: SESSIONS}, "US winter")
+    rewritten = tomllib.loads(settings_path.read_text(encoding="utf-8"))
+    assert rewritten["symbols"][SYMBOL]["hours_utc_season"] == "US winter"

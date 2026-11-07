@@ -80,7 +80,7 @@ def run_random_entry_control(
             }
             continue
 
-        baseline_expectancy = _expectancy_r(baseline.trades)
+        baseline_expectancy = _expectancy_r(baseline.trades, baseline.deals)
         if baseline_expectancy is None:
             strategy_results[strategy] = {
                 "status": "INCONCLUSIVE",
@@ -155,7 +155,7 @@ def run_random_entry_control(
                     }
                 )
                 continue
-            expectancy = _expectancy_r(matched.trades)
+            expectancy = _expectancy_r(matched.trades, matched.deals)
             if expectancy is None:
                 run_rows.append(
                     {
@@ -183,7 +183,10 @@ def run_random_entry_control(
         percentile = (
             _percentile(random_values, 0.95) if random_values else None
         )
-        complete = len(random_values) == runs
+        complete = (
+            runs == DEFAULT_RANDOM_RUNS
+            and len(random_values) == DEFAULT_RANDOM_RUNS
+        )
         status = (
             "INCONCLUSIVE"
             if not complete or baseline_expectancy is None or percentile is None
@@ -211,6 +214,7 @@ def run_random_entry_control(
             "random_expectancy_95th_percentile_r": percentile,
             "completed_runs": len(random_values),
             "requested_runs": runs,
+            "acceptance_run_count_met": runs == DEFAULT_RANDOM_RUNS,
             "seed": seed,
             "runs": run_rows,
         }
@@ -242,14 +246,25 @@ def run_random_entry_control(
     return destination
 
 
-def _expectancy_r(trades: tuple[Any, ...]) -> float | None:
-    values = [
-        trade.result_r
-        for trade in trades
-        if trade.closed_at_utc is not None
-        and trade.result_r is not None
-        and math.isfinite(trade.result_r)
-    ]
+def _expectancy_r(
+    trades: tuple[Any, ...],
+    deals: tuple[Any, ...],
+) -> float | None:
+    deals_by_position: dict[str, list[Any]] = {}
+    for deal in deals:
+        deals_by_position.setdefault(deal.position_ticket, []).append(deal)
+    values: list[float] = []
+    for trade in trades:
+        trade_deals = deals_by_position.get(trade.ticket, [])
+        if (
+            trade.actual_risk <= 0
+            or not any(deal.is_entry is False for deal in trade_deals)
+        ):
+            continue
+        net_profit = sum(deal.profit - deal.commission for deal in trade_deals)
+        result_r = net_profit / trade.actual_risk
+        if math.isfinite(result_r):
+            values.append(result_r)
     return sum(values) / len(values) if values else None
 
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
+from math import isfinite
 from typing import Any, Protocol, cast
 
 import MetaTrader5 as mt5
@@ -16,13 +18,19 @@ from bot.adapters.broker import (
     OrderRequest,
     Tick,
 )
-from bot.core.timeutil import broker_to_utc, check_broker_offset
+from bot.core.timeutil import (
+    broker_wall_time_to_utc,
+    expected_new_york_offset,
+    rounded_server_offset_from_tick,
+)
 from bot.core.types import Candle, Side, SymbolSpec
 
 SERVER_OFFSET_REFERENCE_SYMBOL = "EURUSD"
 SERVER_OFFSET_MAX_TICK_AGE_S = 60
+SERVER_OFFSET_SAMPLE_COUNT = 3
+SERVER_OFFSET_MAX_SAMPLE_ATTEMPTS = 30
+SERVER_OFFSET_SAMPLE_INTERVAL_S = 0.1
 _WEEKDAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-# DECISION-PENDING: confirm the tick-derived offset against the MT5 server clock before relying on it.
 
 
 class _SymbolInfo(Protocol):
@@ -144,12 +152,12 @@ class MT5ReadOnlyBroker:
         api: _MT5API | None = None,
         history_start_utc: datetime | None = None,
         history_end_utc: datetime | None = None,
-        server_offset_provider: Callable[[], object] | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._api = cast(_MT5API, mt5) if api is None else api
         self._history_start_utc = history_start_utc
         self._history_end_utc = history_end_utc
-        self._server_offset_provider = server_offset_provider
+        self._clock = (lambda: datetime.now(tz=UTC)) if clock is None else clock
         if history_start_utc is not None:
             _require_utc(history_start_utc, "history_start_utc")
         if history_end_utc is not None:
@@ -224,7 +232,7 @@ class MT5ReadOnlyBroker:
         spec = self.symbol_info(symbol)
         candles = tuple(
             Candle(
-                time=datetime.fromtimestamp(int(rate["time"]), tz=UTC),
+                time=broker_wall_time_to_utc(int(rate["time"])),
                 open=float(rate["open"]),
                 high=float(rate["high"]),
                 low=float(rate["low"]),
@@ -240,23 +248,11 @@ class MT5ReadOnlyBroker:
         info = self._api.symbol_info_tick(symbol)
         if info is None:
             return None
-        timestamp = info.time_msc / 1_000 if info.time_msc else info.time
-        return Tick(datetime.fromtimestamp(timestamp, tz=UTC), info.bid, info.ask)
+        server_epoch = info.time_msc / 1_000 if info.time_msc else info.time
+        return Tick(broker_wall_time_to_utc(server_epoch), info.bid, info.ask)
 
     def server_utc_offset_hours(self) -> int:
-        if self._server_offset_provider is not None:
-            offset = self._server_offset_provider()
-        else:
-            terminal = self._api.terminal_info()
-            offset = getattr(terminal, "server_utc_offset_hours", None)
-            if offset is None:
-                raise RuntimeError(
-                    "The standard MT5 Python API does not expose a server UTC offset. "
-                    "Supply a broker-reported offset provider; do not infer it from UTC ticks."
-                )
-        if isinstance(offset, bool) or not isinstance(offset, int) or not -12 <= offset <= 14:
-            raise ValueError("Broker server UTC offset must be an integer in -12..14")
-        return offset
+        return expected_new_york_offset(_require_utc(self._clock(), "clock"))
 
 
 class MT5Broker:
@@ -266,12 +262,15 @@ class MT5Broker:
         self,
         *,
         api: _MT5API | None = None,
-        server_offset_provider: Callable[[], object] | None = None,
+        server_clock_sanity_provider: Callable[[], object] | None = None,
+        on_server_clock_mismatch: Callable[[str], None] | None = None,
         clock: Callable[[], datetime] | None = None,
         deviation_points: int = 30,
     ) -> None:
         self._api = cast(_MT5API, mt5) if api is None else api
-        self._server_offset_provider = server_offset_provider
+        self._server_clock_sanity_provider = server_clock_sanity_provider
+        self._on_server_clock_mismatch = on_server_clock_mismatch
+        self._server_clock_checked = False
         self._clock = (lambda: datetime.now(tz=UTC)) if clock is None else clock
         self._deviation_points = deviation_points
         self._connected = False
@@ -454,39 +453,97 @@ class MT5Broker:
         info = self._api.symbol_info_tick(symbol)
         if info is None:
             return None
-        timestamp = info.time_msc / 1_000 if getattr(info, "time_msc", 0) else info.time
-        return Tick(datetime.fromtimestamp(timestamp, tz=UTC), float(info.bid), float(info.ask))
+        server_epoch = (
+            info.time_msc / 1_000
+            if getattr(info, "time_msc", 0)
+            else info.time
+        )
+        return Tick(
+            broker_wall_time_to_utc(server_epoch),
+            float(info.bid),
+            float(info.ask),
+        )
 
     def server_utc_offset_hours(self) -> int:
         now_utc = _require_utc(self._clock(), "clock")
-        if self._server_offset_provider is not None:
-            offset = self._server_offset_provider()
-            if isinstance(offset, bool) or not isinstance(offset, int):
-                raise ValueError("Broker server UTC offset must be an integer")
-            offset_int = offset
-        else:
+        expected_offset = expected_new_york_offset(now_utc)
+        if not self._server_clock_checked:
+            mismatch = self._server_clock_sanity_mismatch(expected_offset)
+            if mismatch is not None:
+                if self._on_server_clock_mismatch is None:
+                    raise RuntimeError(mismatch)
+                self._on_server_clock_mismatch(mismatch)
+            self._server_clock_checked = True
+        return expected_offset
+
+    def _server_clock_sanity_mismatch(self, expected_offset: int) -> str | None:
+        try:
+            observed_offset = (
+                self._observed_server_offset_from_ticks(expected_offset)
+                if self._server_clock_sanity_provider is None
+                else self._observed_server_offset_from_provider()
+            )
+        except (OSError, OverflowError, RuntimeError, ValueError) as error:
+            return f"Could not verify the MT5 server clock: {error}"
+        if observed_offset != expected_offset:
+            return (
+                f"MT5 server clock reports UTC{observed_offset:+g}, but the "
+                f"New York + 7h rule expects UTC{expected_offset:+d}"
+            )
+        return None
+
+    def _observed_server_offset_from_provider(self) -> float:
+        value = self._server_clock_sanity_provider()
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not isfinite(value)
+        ):
+            raise ValueError("server clock sanity value must be finite numeric hours")
+        return float(value)
+
+    def _observed_server_offset_from_ticks(self, expected_offset: int) -> float:
+        observed_offsets: list[float] = []
+        last_time_msc = 0
+        attempts = 0
+        while (
+            len(observed_offsets) < SERVER_OFFSET_SAMPLE_COUNT
+            and attempts < SERVER_OFFSET_MAX_SAMPLE_ATTEMPTS
+        ):
+            attempts += 1
             tick = self._api.symbol_info_tick(SERVER_OFFSET_REFERENCE_SYMBOL)
-            if tick is None:
-                raise RuntimeError(
-                    f"Could not read a fresh {SERVER_OFFSET_REFERENCE_SYMBOL} tick "
-                    "to infer the broker offset"
-                )
-            server_epoch = float(getattr(tick, "time_msc", 0)) / 1000.0 if getattr(tick, "time_msc", 0) else float(getattr(tick, "time", 0))
-            server_time = datetime.fromtimestamp(server_epoch, tz=UTC)
-            offset_int = round((server_time - now_utc).total_seconds() / 3600)
-            if not -12 <= offset_int <= 14:
-                raise ValueError("Broker server UTC offset must be in -12..14")
-            tick_time_utc = server_time - timedelta(hours=offset_int)
-            age = abs((now_utc - tick_time_utc).total_seconds())
-            if age > SERVER_OFFSET_MAX_TICK_AGE_S:
-                raise RuntimeError(
-                    f"Fresh {SERVER_OFFSET_REFERENCE_SYMBOL} server tick required "
-                    "to infer the broker offset"
-                )
-        if not -12 <= offset_int <= 14:
-            raise ValueError("Broker server UTC offset must be in -12..14")
-        check_broker_offset(offset_int, now_utc)
-        return offset_int
+            if tick is not None:
+                time_msc = getattr(tick, "time_msc", 0)
+                if isinstance(time_msc, bool) or not isinstance(time_msc, int) or time_msc <= 0:
+                    raise ValueError("EURUSD tick has no valid time_msc")
+                if time_msc < last_time_msc:
+                    raise ValueError("EURUSD tick time_msc moved backwards")
+                if time_msc > last_time_msc:
+                    now_utc = _require_utc(self._clock(), "clock")
+                    observed_offset = rounded_server_offset_from_tick(
+                        time_msc, now_utc
+                    )
+                    tick_utc = datetime.fromtimestamp(time_msc / 1_000, tz=UTC)
+                    age = abs(
+                        (
+                            now_utc
+                            - (tick_utc - timedelta(hours=observed_offset))
+                        ).total_seconds()
+                    )
+                    if age > SERVER_OFFSET_MAX_TICK_AGE_S:
+                        raise RuntimeError("EURUSD sanity tick is stale")
+                    observed_offsets.append(observed_offset)
+                    last_time_msc = time_msc
+            if len(observed_offsets) < SERVER_OFFSET_SAMPLE_COUNT:
+                time.sleep(SERVER_OFFSET_SAMPLE_INTERVAL_S)
+        if len(observed_offsets) != SERVER_OFFSET_SAMPLE_COUNT:
+            raise RuntimeError(
+                f"EURUSD time_msc did not advance across "
+                f"{SERVER_OFFSET_SAMPLE_COUNT} fresh ticks"
+            )
+        if any(value != observed_offsets[0] for value in observed_offsets[1:]):
+            raise RuntimeError("EURUSD tick offsets were inconsistent")
+        return observed_offsets[0]
 
     def calculate_margin(self, request: OrderRequest) -> float | None:
         price = self._execution_price_for(request)
@@ -508,7 +565,7 @@ class MT5Broker:
             raise RuntimeError(f"MetaTrader 5 positions_get failed: {self._api.last_error()}")
         if not raw:
             return ()
-        offset_hours = self.server_utc_offset_hours()
+        self.server_utc_offset_hours()
         positions: list[BrokerPosition] = []
         for item in raw:
             item_magic = int(getattr(item, "magic", 0))
@@ -528,9 +585,8 @@ class MT5Broker:
                     take_profit=float(getattr(item, "tp", 0.0) or 0.0),
                     magic_number=item_magic,
                     comment=str(getattr(item, "comment", "")),
-                    opened_at_utc=broker_to_utc(
-                        int(getattr(item, "time", 0)),
-                        offset_hours,
+                    opened_at_utc=broker_wall_time_to_utc(
+                        int(getattr(item, "time", 0))
                     ),
                     entry_commission=float(getattr(item, "commission", 0.0)),
                 )
@@ -543,7 +599,7 @@ class MT5Broker:
             raise RuntimeError(f"MetaTrader 5 history_deals_get failed: {self._api.last_error()}")
         if not raw:
             return ()
-        offset_hours = self.server_utc_offset_hours()
+        self.server_utc_offset_hours()
         deals: list[BrokerDeal] = []
         for item in raw:
             item_magic = int(getattr(item, "magic", 0))
@@ -559,10 +615,7 @@ class MT5Broker:
                     side=side,
                     lots=float(getattr(item, "volume", 0.0)),
                     price=float(getattr(item, "price", 0.0)),
-                    time_utc=broker_to_utc(
-                        int(getattr(item, "time", 0)),
-                        offset_hours,
-                    ),
+                    time_utc=broker_wall_time_to_utc(int(getattr(item, "time", 0))),
                     profit=float(getattr(item, "profit", 0.0)),
                     commission=float(getattr(item, "commission", 0.0)),
                     magic_number=item_magic,

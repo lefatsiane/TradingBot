@@ -14,7 +14,12 @@ from bot.adapters.store import StateStore
 from bot.app.config import load_settings
 from bot.app.engine import Engine
 from bot.app.executor import Executor
-from bot.app.runtime import BotRuntime, CrashLoopGuard, RuntimeFileLock
+from bot.app.runtime import (
+    BotRuntime,
+    CrashLoopGuard,
+    RuntimeFileLock,
+    _block_new_entries_for_clock_mismatch,
+)
 from bot.core.clock import SimClock
 from bot.core.types import Side, SymbolSpec
 
@@ -30,6 +35,21 @@ SPEC = SymbolSpec(
     100,
     contract_size=100_000,
 )
+
+
+def test_server_clock_mismatch_blocks_entries_and_queues_critical_alert(
+    tmp_path,
+) -> None:
+    store = StateStore(tmp_path / "runtime.db")
+    clock = SimClock(datetime(2026, 10, 26, 12, tzinfo=UTC))
+
+    _block_new_entries_for_clock_mismatch(store, clock, "offset mismatch")
+
+    assert store.get_flag("stop_new")
+    alerts = store.pending_alerts()
+    assert len(alerts) == 1
+    assert alerts[0].severity == "CRITICAL"
+    assert "offset mismatch" in alerts[0].message
 
 
 def test_third_unplanned_start_sets_stop_new_and_alerts(tmp_path) -> None:
@@ -87,6 +107,7 @@ def test_runtime_clean_shutdown_leaves_protected_positions_open(tmp_path) -> Non
         update={
             "enabled": True,
             "hours_utc": ("mon 00:00-21:55", "fri 00:00-21:55"),
+            "hours_utc_season": "US summer",
         }
     )
     settings = settings.model_copy(

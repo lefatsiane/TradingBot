@@ -103,6 +103,7 @@ def _settings():
                 "thu 00:00-21:55",
                 "fri 00:00-21:55",
             ),
+            "hours_utc_season": "US winter",
         }
     )
     return settings.model_copy(update={"symbols": symbols})

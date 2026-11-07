@@ -22,7 +22,7 @@ class StrategyAParams:
     min_stop_atr: float = 1.0
     max_stop_atr: float = 3.0
     take_profit_r: float = 2.0
-    min_candles: int = 600
+    min_candles: int = 300
     window_candles: int = 1_000
     cooldown_bars_after_stop: int = 6
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +16,21 @@ from tools.stats import (
     record_variant,
     write_scorecard,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_stats_cli_help_runs_from_project_root() -> None:
+    result = subprocess.run(
+        [sys.executable, "tools/stats.py", "--help"],
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "Analyze a replay report" in result.stdout
 
 
 def test_statistics_use_candle_closes_and_calendar_week_bootstrap() -> None:
@@ -186,3 +204,132 @@ def test_variant_counter_persists_unique_trials_and_rejects_duplicate_ids(
 
     stored = json.loads(ledger.read_text(encoding="utf-8"))
     assert len(stored["variants"]) == 2
+
+
+def test_scorecard_reports_news_blocked_signals_overlapping_trades_and_variants(
+    tmp_path,
+) -> None:
+    report_dir = tmp_path / "reports" / "replay"
+    report_dir.mkdir(parents=True)
+    report_root = report_dir.parent
+    (report_root / "variants.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "variants": [{"variant_id": "a1"}, {"variant_id": "b1"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (report_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "starting_equity": 1_000,
+                "code_version": "abc123",
+                "settings_version": "def456",
+                "news_enabled": True,
+                "news_calendar_valid": True,
+                "news_events": [
+                    {
+                        "time_utc": "2026-01-05T13:00:00+00:00",
+                        "currency": "USD",
+                        "impact": "high",
+                        "title": "CPI",
+                    }
+                ],
+                "news_block_before_min": 30,
+                "news_block_after_min": 30,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (report_dir / "equity_curve.csv").write_text(
+        "time_utc,equity\n2026-01-05T12:00:00+00:00,1000\n"
+        "2026-01-05T14:00:00+00:00,1005\n",
+        encoding="utf-8",
+    )
+    (report_dir / "decisions.csv").write_text(
+        "time_utc,symbol,reason,strategy,side,entry,stop_loss,take_profit\n"
+        "2026-01-05T12:00:00+00:00,EURUSD,NEWS_WINDOW,A,,,,\n"
+        "2026-01-05T13:00:00+00:00,EURUSD,ENTRY_ALLOWED,A,long,1.1,1.09,1.12\n",
+        encoding="utf-8",
+    )
+    (report_dir / "trades.csv").write_text(
+        "ticket,symbol,strategy,timeframe,side,lots,entry_time_utc,exit_time_utc,"
+        "entry_price,exit_price,profit,commission,open\n"
+        "1,EURUSD,A,H1,long,0.1,2026-01-05T12:45:00+00:00,"
+        "2026-01-05T13:15:00+00:00,1.1,1.101,10,2,False\n"
+        "2,GBPUSD,A,H1,long,0.1,2026-01-05T11:00:00+00:00,"
+        "2026-01-05T12:00:00+00:00,1.2,1.199,-5,1,False\n",
+        encoding="utf-8",
+    )
+
+    scorecard = json.loads(write_scorecard(report_dir).read_text(encoding="utf-8"))
+
+    assert scorecard["variant_count"] == 2
+    assert scorecard["news_metrics"] == {
+        "status": "AVAILABLE",
+        "news_gate_blocked_signals": 1,
+        "event_count": 1,
+        "overlapping_trade_count": 1,
+        "overlapping_closed_trade_count": 1,
+        "overlapping_open_trade_count": 0,
+        "overlapping_net_profit": pytest.approx(8.0),
+        "overlapping_winning_trades": 1,
+        "overlapping_losing_trades": 0,
+    }
+
+
+def test_scorecard_marks_news_overlap_and_variant_count_unavailable(tmp_path) -> None:
+    report_dir = tmp_path / "replay"
+    report_dir.mkdir()
+    (report_dir / "summary.json").write_text(
+        json.dumps({"starting_equity": 1_000}),
+        encoding="utf-8",
+    )
+    (report_dir / "equity_curve.csv").write_text(
+        "time_utc,equity\n2026-01-05T12:00:00+00:00,1000\n",
+        encoding="utf-8",
+    )
+
+    scorecard = analyze_report(report_dir)
+
+    assert scorecard["variant_count"] is None
+    assert scorecard["news_metrics"]["status"] == "UNAVAILABLE"
+    assert scorecard["news_metrics"]["news_gate_blocked_signals"] is None
+
+
+def test_scorecard_keeps_news_overlap_unavailable_for_invalid_calendar(tmp_path) -> None:
+    report_dir = tmp_path / "replay"
+    report_dir.mkdir()
+    (report_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "starting_equity": 1_000,
+                "news_enabled": True,
+                "news_calendar_valid": False,
+                "news_events": [
+                    {
+                        "time_utc": "2026-01-05T13:00:00+00:00",
+                        "currency": "USD",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (report_dir / "equity_curve.csv").write_text(
+        "time_utc,equity\n2026-01-05T12:00:00+00:00,1000\n",
+        encoding="utf-8",
+    )
+    (report_dir / "decisions.csv").write_text(
+        "time_utc,symbol,reason\n"
+        "2026-01-05T12:00:00+00:00,EURUSD,NEWS_WINDOW\n",
+        encoding="utf-8",
+    )
+
+    scorecard = analyze_report(report_dir)
+
+    assert scorecard["news_metrics"]["status"] == "UNAVAILABLE"
+    assert scorecard["news_metrics"]["news_gate_blocked_signals"] == 1
+    assert scorecard["news_metrics"]["event_count"] is None
