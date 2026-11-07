@@ -235,7 +235,7 @@ def test_cost_gate_rejects_expensive_spread() -> None:
     assert sized.lots is None
 
 
-def test_daily_headroom_credits_closed_profit() -> None:
+def test_daily_headroom_does_not_credit_closed_profit() -> None:
     positions = [OpenRisk("EURUSD", Side.LONG, 0.5)]
     result = evaluate_entry(
         symbol="GBPUSD",
@@ -253,7 +253,27 @@ def test_daily_headroom_credits_closed_profit() -> None:
         bars_since_stop=None,
     )
     assert result.allowed
-    assert result.daily_headroom_pct == pytest.approx(1.0)
+    assert result.daily_headroom_pct == pytest.approx(0.5)
+
+
+def test_realized_profit_does_not_raise_daily_headroom() -> None:
+    result = evaluate_entry(
+        symbol="EURUSD",
+        side=Side.LONG,
+        new_risk_pct=0.51,
+        positions=[],
+        pending=[],
+        specs={"EURUSD": EURUSD},
+        realized_pnl_today=300.0,
+        start_of_day_equity=3_000.0,
+        margin_used_after_pct=0.0,
+        bars_since_stop=None,
+        limits=RiskLimits(daily_loss_pct=0.5),
+    )
+
+    assert not result.allowed
+    assert result.reason == "DAILY_HEADROOM"
+    assert result.daily_headroom_pct == pytest.approx(0.5)
 
 
 def test_daily_headroom_subtracts_full_risk_of_open_trades() -> None:
@@ -285,8 +305,8 @@ def test_daily_headroom_subtracts_full_risk_of_open_trades() -> None:
 
 def test_net_currency_exposure_refuses_excess_dollar_risk() -> None:
     positions = [
-        OpenRisk("EURUSD", Side.LONG, 0.45),
-        OpenRisk("GBPUSD", Side.LONG, 0.45),
+        OpenRisk("EURUSD", Side.LONG, 0.2),
+        OpenRisk("GBPUSD", Side.LONG, 0.2),
     ]
     specs = {
         "EURUSD": EURUSD,
@@ -304,7 +324,7 @@ def test_net_currency_exposure_refuses_excess_dollar_risk() -> None:
         start_of_day_equity=3_000.0,
         margin_used_after_pct=0.0,
         bars_since_stop=None,
-        limits=RiskLimits(),
+        limits=RiskLimits(max_net_currency_exposure_pct=0.5),
     )
     assert not result.allowed
     assert result.reason == "CURRENCY_EXPOSURE"
@@ -343,6 +363,57 @@ def test_entry_enforces_symbol_slot_and_trade_count(
         pending=[],
         specs=specs,
         realized_pnl_today=30.0,
+        start_of_day_equity=3_000.0,
+        margin_used_after_pct=0.0,
+        bars_since_stop=None,
+    )
+
+    assert not result.allowed
+    assert result.reason == reason
+
+
+@pytest.mark.parametrize(
+    ("positions", "symbol", "new_risk_pct", "reason"),
+    [
+        (
+            [
+                OpenRisk("EURUSD", Side.LONG, 0.3),
+                OpenRisk("GBPUSD", Side.SHORT, 0.3),
+                OpenRisk("AUDUSD", Side.LONG, 0.3),
+            ],
+            "XAUUSD",
+            0.2,
+            "MAX_TRADES",
+        ),
+        (
+            [
+                OpenRisk("EURUSD", Side.LONG, 0.4),
+                OpenRisk("GBPUSD", Side.LONG, 0.4),
+            ],
+            "AUDUSD",
+            0.3,
+            "CURRENCY_EXPOSURE",
+        ),
+    ],
+)
+def test_entry_risk_reason_precedence(
+    positions: list[OpenRisk], symbol: str, new_risk_pct: float, reason: str
+) -> None:
+    specs = {
+        "EURUSD": EURUSD,
+        "GBPUSD": SymbolSpec("GBPUSD", "GBP", "USD", 0.00001, 0.0001, 10, 0.01, 0.01, 100),
+        "AUDUSD": SymbolSpec("AUDUSD", "AUD", "USD", 0.00001, 0.0001, 10, 0.01, 0.01, 100),
+        "XAUUSD": SymbolSpec("XAUUSD", "XAU", "USD", 0.01, 0.01, 1, 0.01, 0.01, 100),
+    }
+
+    result = evaluate_entry(
+        symbol=symbol,
+        side=Side.LONG,
+        new_risk_pct=new_risk_pct,
+        positions=positions,
+        pending=[],
+        specs=specs,
+        realized_pnl_today=0.0,
         start_of_day_equity=3_000.0,
         margin_used_after_pct=0.0,
         bars_since_stop=None,

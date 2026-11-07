@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
-from bot.adapters.mt5_broker import MT5ReadOnlyBroker
+from bot.adapters.broker import OrderRequest
+from bot.adapters.mt5_broker import MT5Broker, MT5ReadOnlyBroker
+from bot.core.types import Side
 
 
 @dataclass(frozen=True)
@@ -155,3 +158,690 @@ def test_mt5_adapter_rejects_naive_history_range() -> None:
             history_start_utc=datetime(2026, 1, 1),
             history_end_utc=datetime(2026, 2, 1, tzinfo=UTC),
         )
+
+
+class FakeLiveMT5API:
+    TIMEFRAME_H1 = 60
+    TIMEFRAME_H4 = 240
+    TRADE_ACTION_DEAL = 1
+    TRADE_ACTION_SLTP = 6
+    ORDER_TYPE_BUY = 0
+    ORDER_TYPE_SELL = 1
+    ORDER_TYPE_BUY_LIMIT = 2
+    ORDER_TYPE_SELL_LIMIT = 3
+    ORDER_TYPE_BUY_STOP = 4
+    ORDER_TYPE_SELL_STOP = 5
+    ORDER_FILLING_IOC = 1
+    ORDER_FILLING_FOK = 0
+    SYMBOL_FILLING_FOK = 1
+    SYMBOL_FILLING_IOC = 2
+    ORDER_TIME_GTC = 0
+    ACCOUNT_TRADE_MODE_DEMO = 0
+    ACCOUNT_TRADE_MODE_CONTEST = 1
+    ACCOUNT_TRADE_MODE_REAL = 2
+    ACCOUNT_MARGIN_MODE_RETAIL_NETTING = 0
+    ACCOUNT_MARGIN_MODE_EXCHANGE = 1
+    ACCOUNT_MARGIN_MODE_RETAIL_HEDGING = 2
+    TRADE_RETCODE_DONE = 10009
+    TRADE_RETCODE_INVALID_STOPS = 10016
+    TRADE_RETCODE_INVALID_FILL = 10030
+    TRADE_RETCODE_REQUOTE = 10004
+    TRADE_RETCODE_REJECT = 10006
+    TRADE_RETCODE_REJECTED = 10006
+    TRADE_RETCODE_NO_MONEY = 10019
+    TRADE_RETCODE_MARKET_CLOSED = 10018
+    TRADE_RETCODE_TIMEOUT = 10012
+    TRADE_RETCODE_PRICE_OFF = 10021
+    TRADE_RETCODE_CONNECTION = 10031
+    TRADE_RETCODE_UNKNOWN = 10008
+
+    def __init__(
+        self,
+        *,
+        order_retcode: int = 10009,
+        hedge_close: bool = True,
+        timeout_on_send: bool = False,
+        position_type: int = 0,
+    ) -> None:
+        self.order_retcode = order_retcode
+        self.hedge_close = hedge_close
+        self.timeout_on_send = timeout_on_send
+        self.position_type = position_type
+        self.last_order: dict[str, object] | None = None
+        self.deals: list[SimpleNamespace] = []
+        self.initialize_result = True
+        self.login_result = True
+        self.login_args: tuple[int, str, str] | None = None
+        self.shutdown_calls = 0
+        self.order_check_calls = 0
+        self.order_send_calls = 0
+        self.history_calls: list[tuple[datetime, datetime | None]] = []
+        self.margin_args: tuple[int, str, float, float] | None = None
+        self.positions_result: list[SimpleNamespace] | None = None
+        self.history_result: list[SimpleNamespace] | None = None
+        self.symbol_select_result = True
+        self.trading_sessions: dict[int, list[tuple[int, int]]] = {}
+        self._tick = SimpleNamespace(
+            time=1_767_620_400,
+            time_msc=1_767_620_400_250,
+            bid=1.1,
+            ask=1.1001,
+        )
+        self._info = SimpleNamespace(
+            currency_base="EUR",
+            currency_profit="USD",
+            point=0.00001,
+            trade_tick_size=0.0001,
+            trade_tick_value_loss=10.0,
+            volume_min=0.01,
+            volume_step=0.01,
+            volume_max=100.0,
+            digits=5,
+            trade_contract_size=100_000.0,
+            filling_mode=self.SYMBOL_FILLING_IOC,
+        )
+        self._account = SimpleNamespace(
+            login=123456,
+            server="ICMarkets-Demo",
+            currency="USD",
+            balance=3000.0,
+            equity=3000.0,
+            trade_mode=self.ACCOUNT_TRADE_MODE_DEMO,
+            trade_allowed=True,
+            margin_mode=self.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+            leverage=100,
+        )
+
+    def initialize(self) -> bool:
+        return self.initialize_result
+
+    def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+    def login(self, login: int, password: str, server: str) -> bool:
+        self.login_args = (login, password, server)
+        return self.login_result
+
+    def last_error(self) -> tuple[int, str]:
+        return (0, "success")
+
+    def terminal_info(self) -> SimpleNamespace:
+        return SimpleNamespace(connected=True, trade_allowed=True, name="MT5", company="MetaQuotes")
+
+    def account_info(self) -> SimpleNamespace:
+        return self._account
+
+    def symbol_info(self, symbol: str) -> SimpleNamespace:
+        assert symbol == "EURUSD"
+        return self._info
+
+    def symbol_select(self, symbol: str, enable: bool) -> bool:
+        return self.symbol_select_result
+
+    def symbol_info_session_trade(
+        self,
+        symbol: str,
+        day_of_week: int,
+        session_index: int,
+    ) -> SimpleNamespace | None:
+        day_sessions = self.trading_sessions.get(day_of_week, [])
+        if session_index >= len(day_sessions):
+            return None
+        start, end = day_sessions[session_index]
+        return SimpleNamespace(**{"from": start, "to": end})
+
+    def symbol_info_tick(self, symbol: str) -> SimpleNamespace:
+        assert symbol == "EURUSD"
+        return self._tick
+
+    def copy_rates_range(
+        self,
+        symbol: str,
+        timeframe: int,
+        date_from: datetime,
+        date_to: datetime,
+    ) -> list[dict[str, float | int]]:
+        return [{
+            "time": int(date_from.timestamp()),
+            "open": 1.1,
+            "high": 1.101,
+            "low": 1.099,
+            "close": 1.1005,
+            "spread": 10,
+            "tick_volume": 100,
+        }]
+
+    def positions_get(self, group: str = "", symbol: str = "") -> list[SimpleNamespace]:
+        if self.positions_result is not None:
+            return self.positions_result
+        if self.hedge_close:
+            return [
+                SimpleNamespace(
+                    ticket=42,
+                    magic=712345,
+                    symbol="EURUSD",
+                    type=self.position_type,
+                    volume=0.01,
+                    price_open=1.10,
+                    sl=1.099,
+                    tp=1.102,
+                    comment="1001",
+                    time=1_767_620_400,
+                    commission=0.0,
+                )
+            ]
+        return []
+
+    def history_deals_get(
+        self,
+        date_from: datetime,
+        date_to: datetime | None = None,
+        group: str = "",
+        symbol: str = "",
+    ) -> list[SimpleNamespace]:
+        self.history_calls.append((date_from, date_to))
+        if self.history_result is not None:
+            return self.history_result
+        return self.deals
+
+    def order_calc_margin(
+        self,
+        action: int,
+        symbol: str,
+        volume: float,
+        price: float,
+    ) -> float:
+        self.margin_args = (action, symbol, volume, price)
+        return 12.34
+
+    def order_check(self, request: dict[str, object]) -> SimpleNamespace:
+        self.order_check_calls += 1
+        self.last_order = request
+        return SimpleNamespace(
+            retcode=self.order_retcode,
+            order=1234,
+            price=request["price"],
+            volume=request["volume"],
+            comment=request["comment"],
+            commission=0.0,
+        )
+
+    def order_send(self, request: dict[str, object]) -> SimpleNamespace:
+        self.order_send_calls += 1
+        if self.timeout_on_send:
+            raise TimeoutError("simulated MT5 send timeout")
+        self.last_order = request
+        return SimpleNamespace(
+            retcode=self.order_retcode,
+            order=1234,
+            price=request.get("price"),
+            volume=request.get("volume"),
+            comment=request.get("comment"),
+            commission=0.0,
+        )
+
+
+def test_mt5_broker_uses_live_tick_for_order_checks_and_fill_mode() -> None:
+    api = FakeLiveMT5API()
+    broker = MT5Broker(api=api, deviation_points=20)
+
+    result = broker.check(OrderRequest("EURUSD", Side.LONG, 0.01, 1.099, 1.102, 712345, "1001"))
+
+    assert result.code == "DONE"
+    assert result.ticket == "1234"
+    assert result.price == pytest.approx(api._tick.ask)
+    assert result.lots == pytest.approx(0.01)
+    assert result.commission == pytest.approx(0.0)
+    assert api.last_order is not None
+    assert api.last_order["type_filling"] == api.ORDER_FILLING_IOC
+    assert api.last_order["comment"] == "1001"
+    assert api.last_order["deviation"] == 20
+
+
+def test_mt5_broker_uses_fok_only_when_symbol_allows_only_fok() -> None:
+    api = FakeLiveMT5API()
+    api._info.filling_mode = api.SYMBOL_FILLING_FOK
+    broker = MT5Broker(api=api)
+
+    broker.check(OrderRequest("EURUSD", Side.LONG, 0.01, 1.099, 1.102, 712345, "1001"))
+
+    assert api.last_order is not None
+    assert api.last_order["type_filling"] == api.ORDER_FILLING_FOK
+
+
+def test_mt5_broker_rejects_symbol_with_no_supported_fill_mode() -> None:
+    api = FakeLiveMT5API()
+    api._info.filling_mode = 0
+    broker = MT5Broker(api=api)
+
+    with pytest.raises(RuntimeError, match="filling mode"):
+        broker.check(OrderRequest("EURUSD", Side.LONG, 0.01, 1.099, 1.102, 712345, "1001"))
+
+
+@pytest.mark.parametrize(
+    ("retcode_name", "expected"),
+    [
+        ("TRADE_RETCODE_DONE", "DONE"),
+        ("TRADE_RETCODE_INVALID_STOPS", "INVALID_STOPS"),
+        ("TRADE_RETCODE_INVALID_FILL", "INVALID_FILL"),
+        ("TRADE_RETCODE_REQUOTE", "REQUOTE"),
+        ("TRADE_RETCODE_REJECT", "REJECTED"),
+        ("TRADE_RETCODE_NO_MONEY", "NO_MONEY"),
+        ("TRADE_RETCODE_MARKET_CLOSED", "MARKET_CLOSED"),
+        ("TRADE_RETCODE_TIMEOUT", "TIMEOUT"),
+        ("TRADE_RETCODE_PRICE_OFF", "PRICE_OFF"),
+        ("TRADE_RETCODE_CONNECTION", "CONNECTION"),
+    ],
+)
+def test_mt5_broker_maps_retcode_constants(retcode_name: str, expected: str) -> None:
+    api = FakeLiveMT5API(order_retcode=0)
+    api.order_retcode = getattr(api, retcode_name)
+    broker = MT5Broker(api=api)
+
+    result = broker.check(OrderRequest("EURUSD", Side.LONG, 0.01, 1.099, 1.102, 712345, "1001"))
+
+    assert result.code == expected
+
+
+def test_mt5_broker_rejects_intent_ids_that_cannot_be_preserved_in_comment() -> None:
+    api = FakeLiveMT5API()
+    broker = MT5Broker(api=api)
+
+    with pytest.raises(ValueError, match="numeric.*31"):
+        broker.check(
+            OrderRequest(
+                "EURUSD",
+                Side.LONG,
+                0.01,
+                1.099,
+                1.102,
+                712345,
+                "1" * 32,
+            )
+        )
+
+
+def test_mt5_broker_preserves_maximum_length_intent_comment() -> None:
+    api = FakeLiveMT5API()
+    broker = MT5Broker(api=api)
+    intent_id = "1" * 31
+
+    broker.check(OrderRequest("EURUSD", Side.LONG, 0.01, 1.099, 1.102, 712345, intent_id))
+
+    assert api.last_order is not None
+    assert api.last_order["comment"] == intent_id
+    assert len(str(api.last_order["comment"])) == 31
+
+
+def test_mt5_broker_maps_unrecognized_retcode_to_unknown() -> None:
+    api = FakeLiveMT5API(order_retcode=99999)
+    broker = MT5Broker(api=api)
+
+    result = broker.check(OrderRequest("EURUSD", Side.LONG, 0.01, 1.099, 1.102, 712345, "1001"))
+
+    assert result.code == "UNKNOWN"
+
+
+def test_mt5_broker_returns_unknown_for_send_timeout() -> None:
+    api = FakeLiveMT5API(timeout_on_send=True)
+    broker = MT5Broker(api=api)
+
+    result = broker.send_market(
+        OrderRequest("EURUSD", Side.LONG, 0.01, 1.099, 1.102, 712345, "1001")
+    )
+
+    assert result is None
+
+
+def test_mt5_broker_connect_reads_password_from_caller_selected_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeLiveMT5API()
+    monkeypatch.setenv("TEST_MT5_PASSWORD", "test-password")
+    broker = MT5Broker(api=api)
+
+    assert broker.connect(
+        login=123456,
+        server="Demo-Server",
+        password_env_var="TEST_MT5_PASSWORD",
+    )
+    broker.shutdown()
+
+    assert api.login_args == (123456, "test-password", "Demo-Server")
+    assert api.shutdown_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("trade_mode", "is_demo"),
+    [
+        (FakeLiveMT5API.ACCOUNT_TRADE_MODE_DEMO, True),
+        (FakeLiveMT5API.ACCOUNT_TRADE_MODE_CONTEST, False),
+        (FakeLiveMT5API.ACCOUNT_TRADE_MODE_REAL, False),
+        (False, False),
+    ],
+)
+def test_mt5_broker_identifies_demo_account_from_mt5_trade_mode(
+    trade_mode: int,
+    is_demo: bool,
+) -> None:
+    api = FakeLiveMT5API()
+    api._account.trade_mode = trade_mode
+
+    account = MT5Broker(api=api).account()
+
+    assert account.is_demo is is_demo
+
+
+@pytest.mark.parametrize(
+    ("margin_mode", "expected"),
+    [
+        (FakeLiveMT5API.ACCOUNT_MARGIN_MODE_RETAIL_NETTING, "netting"),
+        (FakeLiveMT5API.ACCOUNT_MARGIN_MODE_EXCHANGE, "exchange"),
+        (FakeLiveMT5API.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING, "hedging"),
+    ],
+)
+def test_mt5_broker_maps_mt5_margin_modes(
+    margin_mode: int,
+    expected: str,
+) -> None:
+    api = FakeLiveMT5API()
+    api._account.margin_mode = margin_mode
+
+    account = MT5Broker(api=api).account()
+
+    assert account.margin_mode == expected
+
+
+def test_mt5_broker_fails_closed_when_account_safety_fields_are_missing() -> None:
+    api = FakeLiveMT5API()
+    del api._account.trade_mode
+    del api._account.trade_allowed
+    del api._account.margin_mode
+
+    account = MT5Broker(api=api).account()
+
+    assert not account.is_demo
+    assert not account.trade_allowed
+    assert account.margin_mode == "unknown"
+
+
+def test_mt5_broker_calculates_margin_with_mt5_market_price() -> None:
+    api = FakeLiveMT5API()
+    broker = MT5Broker(api=api)
+    request = OrderRequest("EURUSD", Side.LONG, 0.01, 1.099, 1.102, 712345, "1001")
+
+    margin = broker.calculate_margin(request)
+
+    assert margin == pytest.approx(12.34)
+    assert api.margin_args == (
+        api.TRADE_ACTION_DEAL,
+        "EURUSD",
+        0.01,
+        api._tick.ask,
+    )
+
+
+def test_mt5_broker_reads_terminal_symbol_and_tick() -> None:
+    api = FakeLiveMT5API()
+    broker = MT5Broker(api=api)
+
+    terminal = broker.terminal_info()
+    symbol = broker.symbol_info("EURUSD")
+    tick = broker.tick("EURUSD")
+    candles = broker.candles("EURUSD", "H1")
+
+    assert terminal.connected
+    assert terminal.trade_allowed
+    assert symbol.name == "EURUSD"
+    assert tick is not None
+    assert tick.bid == api._tick.bid
+    assert tick.ask == api._tick.ask
+    assert candles
+
+
+def test_mt5_broker_converts_symbol_sessions_to_utc_and_splits_midnight() -> None:
+    api = FakeLiveMT5API()
+    api.trading_sessions = {
+        0: [(2 * 60 * 60, 22 * 60 * 60)],
+        1: [(0, 3 * 60 * 60)],
+    }
+    broker = MT5Broker(
+        api=api,
+        server_offset_provider=lambda: 2,
+    )
+
+    assert broker.symbol_sessions_utc("EURUSD") == (
+        "mon 00:00-20:00",
+        "mon 22:00-23:59",
+        "tue 00:00-01:00",
+    )
+
+
+def test_mt5_broker_rejects_symbols_without_trading_sessions() -> None:
+    broker = MT5Broker(api=FakeLiveMT5API(), server_offset_provider=lambda: 2)
+
+    with pytest.raises(RuntimeError, match="no trading sessions"):
+        broker.symbol_sessions_utc("EURUSD")
+
+
+def test_mt5_broker_returns_empty_reads_without_requiring_market_tick() -> None:
+    api = FakeLiveMT5API(hedge_close=False)
+    broker = MT5Broker(api=api)
+
+    assert broker.positions(712345) == ()
+    assert broker.history_deals(datetime(2026, 1, 1, tzinfo=UTC), 712345) == ()
+
+
+def test_mt5_broker_surfaces_position_and_history_read_errors() -> None:
+    api = FakeLiveMT5API()
+    api.positions_result = None
+    api.history_result = None
+    broker = MT5Broker(api=api)
+    api.positions_get = lambda **_: None
+    api.history_deals_get = lambda *_args, **_kwargs: None
+
+    with pytest.raises(RuntimeError, match="positions_get failed"):
+        broker.positions(712345)
+    with pytest.raises(RuntimeError, match="history_deals_get failed"):
+        broker.history_deals(datetime(2026, 1, 1, tzinfo=UTC), 712345)
+
+
+def test_mt5_broker_does_not_treat_failed_position_reads_as_missing_positions() -> None:
+    api = FakeLiveMT5API()
+    broker = MT5Broker(api=api)
+    api.positions_get = lambda **_: None
+
+    modify = broker.modify_sl_tp("42", 1.0995, 1.1025)
+    close = broker.close("42")
+
+    assert modify.code == "UNKNOWN"
+    assert close.code == "UNKNOWN"
+    assert api.order_send_calls == 0
+
+
+def test_mt5_broker_surfaces_failed_symbol_selection() -> None:
+    api = FakeLiveMT5API()
+    api.symbol_select_result = False
+
+    with pytest.raises(RuntimeError, match="symbol_select failed"):
+        MT5Broker(api=api).symbol_info("EURUSD")
+
+
+def test_mt5_broker_shuts_down_terminal_after_login_failure() -> None:
+    api = FakeLiveMT5API()
+    api.login_result = False
+    broker = MT5Broker(api=api)
+
+    with pytest.raises(ConnectionError, match="login failed"):
+        broker.connect(login=123456, server="Demo-Server", password="not-a-real-secret")
+
+    assert api.shutdown_calls == 1
+
+
+def test_mt5_broker_refuses_non_demo_login_and_shuts_down() -> None:
+    api = FakeLiveMT5API()
+    api._account.trade_mode = api.ACCOUNT_TRADE_MODE_REAL
+    broker = MT5Broker(api=api)
+
+    with pytest.raises(PermissionError, match="demo"):
+        broker.connect(login=123456, server="Demo-Server", password="placeholder")
+
+    assert api.shutdown_calls == 1
+
+
+def test_mt5_broker_never_checks_or_sends_orders_on_non_demo_account() -> None:
+    api = FakeLiveMT5API()
+    api._account.trade_mode = api.ACCOUNT_TRADE_MODE_REAL
+    broker = MT5Broker(api=api)
+    request = OrderRequest("EURUSD", Side.LONG, 0.01, 1.099, 1.102, 712345, "1001")
+
+    check = broker.check(request)
+    send = broker.send_market(request)
+    modify = broker.modify_sl_tp("42", 1.0995, 1.1025)
+    close = broker.close("42")
+
+    assert check.code == "TRADE_DISABLED"
+    assert send is not None and send.code == "TRADE_DISABLED"
+    assert modify.code == "TRADE_DISABLED"
+    assert close.code == "TRADE_DISABLED"
+    assert api.order_check_calls == 0
+    assert api.order_send_calls == 0
+
+
+def test_mt5_broker_close_uses_position_field_for_hedging_accounts() -> None:
+    api = FakeLiveMT5API(hedge_close=True)
+    broker = MT5Broker(api=api, deviation_points=10)
+
+    result = broker.close("42")
+
+    assert result.code == "DONE"
+    assert api.last_order is not None
+    assert "position" in api.last_order
+    assert api.last_order["position"] == 42
+    assert api.last_order["type"] == api.ORDER_TYPE_SELL
+    assert api.last_order["price"] == api._tick.bid
+
+
+def test_mt5_broker_netting_close_omits_position_field() -> None:
+    api = FakeLiveMT5API(hedge_close=True)
+    api._account.margin_mode = 0
+    broker = MT5Broker(api=api, deviation_points=10)
+
+    result = broker.close("42")
+
+    assert result.code == "DONE"
+    assert api.last_order is not None
+    assert "position" not in api.last_order
+    assert api.last_order["type"] == api.ORDER_TYPE_SELL
+    assert api.last_order["price"] == api._tick.bid
+
+
+def test_mt5_broker_closes_short_at_ask() -> None:
+    api = FakeLiveMT5API(position_type=FakeLiveMT5API.ORDER_TYPE_SELL)
+    broker = MT5Broker(api=api, deviation_points=10)
+
+    result = broker.close("42")
+
+    assert result.code == "DONE"
+    assert api.last_order is not None
+    assert api.last_order["type"] == api.ORDER_TYPE_BUY
+    assert api.last_order["price"] == api._tick.ask
+
+
+def test_mt5_broker_modifies_stops_for_the_requested_position() -> None:
+    api = FakeLiveMT5API()
+    broker = MT5Broker(api=api, deviation_points=10)
+
+    result = broker.modify_sl_tp("42", 1.0995, 1.1025)
+
+    assert result.code == "DONE"
+    assert api.last_order is not None
+    assert api.last_order["action"] == api.TRADE_ACTION_SLTP
+    assert api.last_order["symbol"] == "EURUSD"
+    assert api.last_order["position"] == 42
+    assert api.last_order["sl"] == 1.0995
+    assert api.last_order["tp"] == 1.1025
+
+
+def test_mt5_broker_converts_position_server_time_using_reported_offset() -> None:
+    api = FakeLiveMT5API()
+    broker = MT5Broker(api=api, server_offset_provider=lambda: 2)
+
+    positions = broker.positions(712345)
+
+    assert len(positions) == 1
+    assert positions[0].opened_at_utc == datetime.fromtimestamp(
+        1_767_620_400 - 2 * 60 * 60,
+        tz=UTC,
+    )
+
+
+def test_mt5_broker_converts_deal_server_time_using_reported_offset() -> None:
+    api = FakeLiveMT5API(hedge_close=False)
+    api.deals.append(
+        SimpleNamespace(
+            ticket=51,
+            position_id=42,
+            symbol="EURUSD",
+            type=api.ORDER_TYPE_BUY,
+            volume=0.01,
+            price=1.1,
+            time=1_767_620_400,
+            profit=2.0,
+            commission=-0.1,
+            magic=712345,
+            comment="1001",
+        )
+    )
+    broker = MT5Broker(api=api, server_offset_provider=lambda: 2)
+
+    deals = broker.history_deals(datetime(2026, 1, 1, tzinfo=UTC), 712345)
+
+    assert len(deals) == 1
+    assert deals[0].time_utc == datetime.fromtimestamp(
+        1_767_620_400 - 2 * 60 * 60,
+        tz=UTC,
+    )
+    assert api.history_calls == [(datetime(2026, 1, 1, tzinfo=UTC), None)]
+
+
+def test_mt5_broker_infers_offset_from_fresh_server_tick() -> None:
+    api = FakeLiveMT5API()
+    now = datetime(2026, 1, 5, 13, 40, tzinfo=UTC)
+    server_epoch = int(now.timestamp()) + 2 * 60 * 60
+    api._tick = SimpleNamespace(
+        time=server_epoch,
+        time_msc=server_epoch * 1000,
+        bid=1.1,
+        ask=1.1001,
+    )
+    broker = MT5Broker(api=api, clock=lambda: now)
+
+    assert broker.server_utc_offset_hours() == 2
+
+
+def test_mt5_broker_rejects_stale_server_tick_after_offset_adjustment() -> None:
+    api = FakeLiveMT5API()
+    now = datetime(2026, 1, 5, 13, 40, tzinfo=UTC)
+    server_epoch = int(now.timestamp()) + 2 * 60 * 60 + 61
+    api._tick = SimpleNamespace(
+        time=server_epoch,
+        time_msc=server_epoch * 1000,
+        bid=1.1,
+        ask=1.1001,
+    )
+    broker = MT5Broker(api=api, clock=lambda: now)
+
+    with pytest.raises(RuntimeError, match="Fresh EURUSD server tick"):
+        broker.server_utc_offset_hours()
+
+
+@pytest.mark.parametrize("offset", [-13, 15, True, 2.5])
+def test_mt5_broker_rejects_invalid_explicit_server_offset(offset: object) -> None:
+    broker = MT5Broker(
+        api=FakeLiveMT5API(),
+        server_offset_provider=lambda: offset,
+    )
+
+    with pytest.raises(ValueError, match="offset"):
+        broker.server_utc_offset_hours()

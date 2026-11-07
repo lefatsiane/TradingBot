@@ -15,18 +15,19 @@ log and traceability matrix are in the [Trading Bot Full SDLC Record](../Trading
 artifacts. Those are outside this Python project and are not part of its package
 or test suite.
 
-The current executable entry point is `python -m bot.main`. Its only command is
-`validate`: it loads and validates the TOML settings, prints a canonical
-settings hash, and exits. Separate tools can retrieve read-only MT5 history and
-run a saved Strategy A replay, but no runtime engine wires the strategy, risk,
-gates, persistence, and broker into a live trading workflow. The MT5 adapter has
-no order-placement path.
+The executable entry point is `python -m bot.main`, with `validate` and `run`
+commands. `validate` checks TOML settings and schedules without connecting to
+MT5. `run` wires the demo-only broker, store, engine, runtime lock, crash-loop
+guard, Telegram control, and optional heartbeat. It has focused simulator tests
+but has not been run against the owner's real demo terminal; runtime acceptance
+remains blocked. The demo-only `MT5Broker` has fake-API coverage only.
 
-The project README identifies MT5 order execution, restart reconciliation,
-fault-drill orchestration, multi-symbol replay/statistics, live news/time/session
-gates, Telegram controls, heartbeat alerts, and demo smoke/failure drills as
-not implemented or enabled. The replay is single-symbol and is not a complete
-backtest verdict engine. The 1 November 2026 EURUSD H1 run saved its report, but
+The project still requires a full-week replay, portfolio statistics, the
+complete automated failure-drill matrix, real demo smoke/restart/control drills,
+and Task Scheduler/laptop verification. An engine-backed multi-symbol replay
+runner is implemented, but a full portfolio run depends on owner-reviewed
+session schedules and complete caches. It is not a complete backtest verdict
+engine. The 1 November 2026 EURUSD H1 run saved its report, but
 its net result was -$226.86 over 401 trades (profit factor 0.935; maximum
 drawdown 11.55%). It is a run-completeness checkpoint, not evidence of
 profitability or readiness. The project must not be used for live trading.
@@ -50,22 +51,27 @@ TradingBot/                                  Parent workspace
     |-- settings.toml                          Demo-only configuration template
     |-- bot/
     |   |-- __init__.py
-    |   |-- main.py                            CLI; configuration validation only
+    |   |-- main.py                            CLI; validation and demo runtime commands
     |   |-- adapters/
     |   |   |-- __init__.py
     |   |   |-- broker.py                      Broker protocol and DTOs
     |   |   |-- gateway.py                     Serialized broker access and bounded read retries
-    |   |   |-- mt5_broker.py                  Read-only MT5 candles/specifications/ticks
+    |   |   |-- mt5_broker.py                  Read-only history adapter and demo-only broker
     |   |   |-- sim_broker.py                  Deterministic demo broker/fault model
     |   |   `-- store.py                       SQLite schema, trade audit and alert outbox
     |   |-- app/
     |   |   |-- __init__.py
     |   |   |-- config.py                      Strict TOML settings models/loader
     |   |   |-- data.py                        Closed bars, history validation and Parquet cache
-    |   |   |-- backtest.py                    Single-symbol Strategy A replay orchestration
+    |   |   |-- backtest.py                    Legacy Strategy A parity reference
+    |   |   |-- replay_runner.py               Engine/Executor/SimBroker multi-symbol replay
+    |   |   |-- engine.py                      Entry evaluation, entry lane, startup and management lanes
+    |   |   |-- executor.py                    Intent-journaled opens/closes and broker reconciliation
     |   |   |-- logging_setup.py               Rotating UTF-8 file logging
     |   |   |-- news.py                        Calendar parsing, validation, block checks
     |   |   |-- reports.py                     CSV/JSON reports and performance metrics
+    |   |   |-- runtime.py                     Lock, runtime threads, crash-loop and shutdown wiring
+    |   |-- symbol_validation.py               Demo symbol/history/session validation
     |   |   `-- versioning.py                  Git commit and clean-tree reporting
     |   `-- core/
     |       |-- __init__.py
@@ -90,19 +96,29 @@ TradingBot/                                  Parent workspace
     |   |-- test_core.py                        Config, core logic, risk, time, replay
     |   |-- test_costs.py                       Cost estimation and sizing gates
     |   |-- test_data.py                        History validation and Parquet cache
+    |   |-- test_engine.py                     Pure decisions, closed-bar progress, management limits
+    |   |-- test_executor.py                   Intent states, fault outcomes, close and reconcile behavior
     |   |-- test_mt5_broker.py                  Read-only adapter mapping and history chunking
     |   |-- test_indicators.py                  EMA and ATR reference values
     |   |-- test_gateway.py                     Serialization and safe retry behavior
     |   |-- test_news.py                        Calendar and event-block behavior
-    |   |-- test_replay.py                      Backtest determinism, holdout and report output
+    |   |-- test_replay.py                      Legacy backtest determinism, holdout and reports
+    |   |-- test_replay_runner.py               Engine replay, holdout, report and parity acceptance
+    |   |-- test_runtime.py                     Crash-loop, file-lock and protected shutdown checks
+    |   |-- test_stats.py                       Bootstrap, candle-close drawdown and scorecard output
     |   |-- test_store.py                       SQLite durability, migrations and outbox
     |   |-- test_strategy_a.py                  Strategy A rule and boundary scenarios
     |   `-- test_strategy_b.py                  Strategy B scenarios
     `-- tools/
         |-- __init__.py
         |-- cache_history.py                    Read-only MT5 H1/H4 history downloader
-        |-- replay.py                           Strategy A replay/report CLI
-        `-- validate_news.py                    Standalone calendar validator
+        |-- replay.py                           Multi-symbol engine replay/report CLI
+        |-- validate_symbols.py                 Demo symbol/session validation CLI
+        |-- backup.py                           SQLite online backup and retention
+        |-- validate_news.py                    Standalone calendar validator
+        `-- stats.py                             Replay statistics and scorecard CLI
+    `-- scripts/
+        `-- install_task.ps1                     Opt-in Windows Task Scheduler registration
 ```
 
 Generated local test/lint/property-test caches (for example `.pytest_cache`,
@@ -119,6 +135,10 @@ Runnable CLI
     -> bot.app.config.load_settings()
     -> strict Pydantic models + TOML parse + canonical settings SHA-256
     -> print validation result and exit
+  python -m bot.main --settings settings.toml run
+    -> runtime lock + StateStore + crash-loop guard + environment secrets
+    -> demo-only MT5Broker -> BrokerGateway -> Engine.start() recovery
+    -> Telegram/heartbeat threads + scheduled management and entry lanes
 
 Standalone news validation
   python tools/validate_news.py --settings settings.toml
@@ -130,10 +150,10 @@ Standalone news validation
 Standalone history and backtest tools
   python tools/cache_history.py --settings settings.toml [--start-utc ...]
     -> read-only MT5 adapter -> closed-bar validation -> Parquet + manifest
-  python tools/replay.py --settings settings.toml --symbol EURUSD --timeframe H1
-    -> cached history -> Strategy A + sizing/risk -> SimBroker -> CSV/JSON report
+  python tools/replay.py --settings settings.toml --strategy both [--no-news] [--final]
+    -> enabled-symbol H1/H4 caches -> Engine + Executor + SimBroker -> CSV/JSON report
 
-Core components (callable independently; not wired into the CLI)
+Core logic and simulator/replay components
   Candle + SymbolSpec -> strategy_a.propose() / strategy_b.propose()
                        -> StrategyResult / Proposal
   Proposal + SymbolSpec + equity/cost assumptions -> sizing.size_trade()
@@ -149,37 +169,64 @@ Core components (callable independently; not wired into the CLI)
          -> validated candle series -> Parquet cache/manifest
 ```
 
-There is deliberately no arrow from `bot.main` to the strategy, replay, broker,
-or store in the current runtime path. `Broker` is a `Protocol`;
-`MT5ReadOnlyBroker` implements only candle, symbol-specification, tick, and
-connection/shutdown operations needed by history caching. It does not provide
-account/position/order management. The standard MT5 Python API does not expose a
-server UTC offset; the adapter requires an explicit provider or terminal
-property, and no broker offset has been verified. `SimBroker` is the simulated
-implementation; its deterministic fault plan supports order and tick failure
-scenarios for tests. News and market-gate helpers exist, but they are not
-integrated/enabled in a runtime engine.
+The `run` command wires `bot.main` to the demo broker, gateway, store, engine,
+and optional Telegram/heartbeat threads. `Broker` is a `Protocol`;
+`MT5ReadOnlyBroker` implements candle, symbol-specification, tick, and
+connection/shutdown operations needed by history caching. `MT5Broker` separately
+implements account/position/order operations with a non-demo refusal guard.
+Its fake-API tests pass, but its real demo-terminal behavior and tick-derived
+offset have not been verified; see `../BLOCKED.md` and `../QUESTIONS.md`.
+`SimBroker` is the simulated implementation; its deterministic fault plan
+supports order and tick failure scenarios for tests. `Engine` accepts a
+context factory and processes closed bars; `run_management_lane()` performs
+reconciliation and risk/position management. The runtime loop is wired, but
+demo acceptance and the engine's full replay acceptance criteria remain open.
 
 ## Module notes and review entry points
 
 ### Application and configuration
 
-- `bot/main.py`: argparse entry point; accepts only the `validate` command.
-  Settings load errors are printed to stderr and return exit code 2.
+- `bot/main.py`: argparse entry point; accepts `validate` and `run`. Runtime
+  startup errors are printed to stderr and return exit code 2; validation does
+  not connect to MT5.
 - `bot/app/config.py`: strict, frozen Pydantic models reject extra fields;
   settings require demo mode and disallow live mode; Strategy A/B values are
   fixed to approved constants; symbol names are restricted to the configured
   forex/metals allowlist. The loader returns the parsed settings plus a
   SHA-256 of canonicalized settings. `build_simulator_costs()` maps configured
   per-symbol commission and slippage assumptions into the simulator.
+  `schedule_validation_failures()` rejects enabled symbols with missing Friday
+  coverage or overlapping sessions; the current template therefore fails
+  `validate` until reviewed broker schedules are applied.
 - `bot/app/data.py`: selects closed candles; checks tick freshness, timestamp
   order/uniqueness, interval gaps, and bounded market closures; reads/writes a
   schema-versioned Parquet cache manifest including symbol specifications and
   gap counts. The cache workflow rejects unexplained gaps.
-- `bot/app/backtest.py`: runs one symbol/timeframe of Strategy A through closed
-  candles, cost-aware sizing, risk checks, and `SimBroker`. The default run
-  excludes the latest 12 months; `--final` permits them. Friday flatten and
-  live-engine parity are not implemented in this runner.
+- `bot/app/backtest.py`: retained single-symbol Strategy A reference replay used
+  for deterministic fixture parity checks. Its default run excludes the latest
+  12 months; `--final` permits them.
+- `bot/app/replay_runner.py`: feeds cached multi-symbol H1/H4 candles through
+  `Engine`, `Executor`, and `SimBroker`; records decisions, trades, equity, and
+  run settings. It applies the engine's configured gates and risk management.
+  Complete history and reviewed schedules are prerequisites for full-portfolio
+  acceptance.
+- `bot/app/symbol_validation.py` and `tools/validate_symbols.py`: validate
+  broker specifications, ticks, H1 history, spread, minimum-lot risk, and
+  sessions; `--write` updates only the `hours_utc` settings.
+- `bot/app/executor.py`: journals entry/close intents before state-changing
+  broker calls, resolves uncertain outcomes through deal/position searches,
+  reconciles trades and positions, and records closes from broker deals.
+- `bot/app/engine.py`: pure `evaluate_candle`, settings-ordered closed-bar entry
+  lane, startup checks, and callable management lane.
+- `bot/app/runtime.py`: Windows file lock, startup sizing diagnostics,
+  crash-loop guard, clean-shutdown marker, stop-signal handling, optional
+  Telegram/heartbeat threads, and periodic management/entry lanes.
+- `tools/backup.py`: SQLite online backup and 14-day retention utility.
+- `tools/stats.py`: writes candle-close drawdown metrics, calendar-week bootstrap
+  confidence intervals, and a date/versioned scorecard. Missing acceptance
+  evidence is marked inconclusive.
+- `scripts/install_task.ps1`: opt-in, confirmation-gated Task Scheduler
+  registration; Windows Task Scheduler behavior remains untested.
 - `bot/app/reports.py`: writes trade and equity-curve CSVs plus a JSON summary
   with net profit, win rate, profit factor, drawdown, and trade count.
 - `settings.toml`: demo-oriented template. It contains account/configuration
@@ -212,15 +259,15 @@ integrated/enabled in a runtime engine.
 - `bot/core/gates.py`: deterministic entry checks for configured UTC session
   windows, weekend no-entry/flatten windows, rollover, app-supplied news
   freshness/event decisions, spread, and abnormal candle range. An empty
-  session schedule fails closed. Startup schedule validation and engine
-  integration remain pending.
+  session schedule fails closed. Configuration validation reports missing and
+  overlapping schedules; the current template intentionally remains incomplete.
 - `bot/core/risk.py`: checks daily headroom, max open/pending trades, one active
   slot per symbol, net base/quote currency risk exposure, prospective margin use,
   and a six-candle post-stop cooldown. `evaluate_loss_limits()` checks daily and
   monthly equity drawdown, including floating P&L. Daily entry headroom is
   computed against start-of-day equity after realized P&L and full open/pending
-  stop risk. These helpers are tested but not wired into an engine or
-  broker-management loop.
+  stop risk. The engine consumes these helpers in its callable evaluation and
+  management lanes; full replay acceptance remains pending.
 - `bot/core/replay.py`: deterministic single-symbol replay. Strategy sees
   closed bars and fills at the next bar open; models spread, commission,
   slippage, stop/target exits, conservative stop-first ordering where both are
@@ -228,9 +275,9 @@ integrated/enabled in a runtime engine.
   backtest and is not the final parity check against the live engine.
 - `bot/core/timeutil.py`: converts broker server wall-clock epochs using the
   broker-reported offset, exposes New York-offset sanity checking, and computes
-  server-midnight day/month boundaries. These helpers are not yet wired to a
-  live broker startup path. The current MT5 adapter does not independently
-  discover a broker offset.
+  server-midnight day/month boundaries. `MT5Broker` derives its offset from a
+  fresh tick, checks it against the New York rule, and uses it for position/deal
+  timestamps; the live-terminal cross-check remains outstanding.
 
 ### Adapters and persistence
 
@@ -238,10 +285,12 @@ integrated/enabled in a runtime engine.
   request/result DTOs, and the `Broker` protocol, including margin calculation
   and broker UTC-offset queries. It defines operations, not a concrete network
   connection.
-- `bot/adapters/mt5_broker.py`: read-only MT5 connection, candle, symbol
-  specification, and tick retrieval for the history workflow. Long ranges are
-  requested in 180-day chunks to avoid terminal truncation. No order APIs are
-  exposed; broker offset lookup requires an explicit provider/property.
+- `bot/adapters/mt5_broker.py`: read-only MT5 history access plus a separate
+  `MT5Broker` implementing the broker protocol. It refuses non-demo accounts,
+  selects only a symbol-supported fill mode, and converts broker-time position
+  and deal epochs using the checked offset. History ranges are requested in
+  180-day chunks. Order operations have fake-API tests only; real demo
+  verification and visual offset confirmation remain outstanding.
 - `bot/adapters/gateway.py`: serializes broker calls, marks transport/lock
   failures degraded, and uses bounded exponential retries only for idempotent
   reads and checks. It does not retry order send, modify, or close operations.
@@ -276,8 +325,10 @@ integrated/enabled in a runtime engine.
   caches cover six enabled FX pairs from 2 December 2021 through 30 October
   2026, not the six-year target. They start at 16:00 UTC on 2 December 2021
   because an earlier six-hour EURUSD H1 gap is unexplained and remains rejected.
-- `tools/replay.py`: runs a single-symbol Strategy A replay from the cache and
-  saves reports under `data/reports/`. The 1 November EURUSD H1 report is at
+- `tools/replay.py`: runs all enabled-symbol caches through the engine-backed
+  replay. The `--strategy a|b|both`, `--no-news`, and `--final` flags control
+  strategy selection, news behavior, and the 12-month holdout. The 1 November
+  legacy EURUSD H1 report is at
   `data/reports/EURUSD/H1/20261101T043220Z-c9c51be3/`; it recorded 401 trades,
   -$226.86 net profit, 33.92% win rate, 0.935 profit factor, and $354.96
   (11.55%) maximum drawdown. It excluded 6,191 recent bars and had no open trade.
@@ -292,7 +343,9 @@ integrated/enabled in a runtime engine.
 | `tests/test_core.py` | UTC Candle validation; Strategy A warm-up/config and exact 1,000-candle window; sizing; equity loss limits; daily headroom, margin, cooldown and currency exposure; DST conversion; replay fill ordering/time stop/input ordering and closed-candle caller boundary |
 | `tests/test_costs.py` | Per-lot spread/commission/slippage estimate, cost-gate rejection and invalid-input handling |
 | `tests/test_data.py` | Tick freshness, candle order/gap checks and Parquet/manifest round-trip |
-| `tests/test_mt5_broker.py` | Read-only MT5 mappings, symbol metadata, time-offset provider, and chunked history retrieval |
+| `tests/test_engine.py` | Entry guard ordering, schedule/news/market gates, closed-candle progress, single-instance lock, monthly flatten |
+| `tests/test_executor.py` | Fault outcomes, stop-new lock check, unknown recovery, close intents, adoption, missing-stop handling and reconciliation |
+| `tests/test_mt5_broker.py` | Read-only mappings plus demo-only MT5 account, offset, order, retcode, fill-mode, and lifecycle behavior using a fake API |
 | `tests/test_replay.py` | Closed-bar holdout, deterministic SimBroker replay, no-lookahead boundary, and saved reports |
 | `tests/test_indicators.py` | EMA and ATR outputs against pandas `ewm` reference formulas |
 | `tests/test_strategy_a.py` | Strategy A long/short proposal, hand-built H1/H4 fixtures, trend/pullback/trigger conditions, stop sizing and per-candle EMA rules |
@@ -302,11 +355,12 @@ integrated/enabled in a runtime engine.
 | `tests/test_broker.py` | Demo-only simulator, bid/ask fills, configurable commission/slippage, candle stop/target exits with stop-first dual-hit handling, account equity, terminal/margin/time metadata, unknown outcomes, crash-after-send, stale ticks, duplicate candles, explicit rejection codes, disconnect/reconnect |
 | `tests/test_store.py` | SQLite durability, schema migration, UTC-only timestamps, alert outbox, versioned trade rows, intent state machine, concurrent writers, duplicate candles, write-once baseline |
 | `tests/test_news.py` | Calendar ordering/coverage and currency-based blocking windows |
+| `tests/test_validate_symbols.py` | SimBroker coverage/spread/sizing/session checks and LF/CRLF-safe `hours_utc` writes |
 
-The current full suite contains 165 passing tests across sixteen test modules;
-`ruff check .` passes for the full project. These results validate components
-and the provisional single-symbol replay, not an integrated engine, broker
-offset, complete six-year dataset, profitability, or demo-trading readiness.
+The current full suite and lint status are recorded in the project README/checkpoint;
+the tests validate components and focused simulator workflows, not the full
+replayed-week acceptance, broker offset, complete six-year dataset,
+profitability, or demo-trading readiness.
 
 Run the project suite from `bot_trader` with:
 
@@ -332,8 +386,10 @@ verdict.
 
 ## Suggested independent review checklist
 
-1. Trace the validation-only application entry point and the separate read-only
-   history adapter; confirm no order-send path is exposed by the MT5 adapter.
+1. Trace both CLI paths: `validate` must remain disconnected from MT5, while
+   `run` must preserve the demo-only guard and single-instance lock. Review
+   `MT5Broker`'s demo refusal; it has not been verified against a real demo
+   terminal.
 2. Verify settings constraints against intended requirements, especially the
    strict Strategy A/B constants and the difference between declared settings
    and values consumed directly by core modules.
@@ -343,9 +399,9 @@ verdict.
    aggregation, volume-step rounding, and behavior at boundaries.
 5. Inspect replay fill semantics, spread side, gaps, ambiguous same-bar
    stop/target hits, commissions/slippage, and time-stop candle counting.
-6. Exercise `SimBroker` unknown outcomes and `StateStore` intent transitions
-   together; note that the tests cover them separately and do not implement
-   restart reconciliation orchestration.
+6. Exercise `SimBroker` unknown outcomes, `StateStore` intent transitions, and
+   `Engine.start()` recovery together; simulator restart tests do not replace
+   real-demo restart acceptance.
 7. Check timezone assumptions and test DST transition boundaries for the
    intended broker's actual server-time convention, including the startup offset
    alert when the live broker value differs from the expected New York rule.

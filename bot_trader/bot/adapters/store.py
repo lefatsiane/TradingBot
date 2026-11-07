@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
+from bot.core.types import ExitReason
+
 IntentStatus = Literal["PENDING", "SENT", "CONFIRMED", "FAILED", "UNKNOWN"]
 _ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     "PENDING": {"SENT", "FAILED", "UNKNOWN"},
@@ -56,7 +58,10 @@ class IntentRecord:
     entry: float
     stop_loss: float
     take_profit: float
+    actual_risk: float
     status: IntentStatus
+    created_at_utc: str
+    ticket: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,12 +95,18 @@ class TradeRecord:
     opened_at_utc: str
     code_version: str
     settings_version: str
+    close_reason: str | None = None
+    closed_at_utc: str | None = None
+    close_price: float | None = None
+    commission: float | None = None
+    result_r: float | None = None
+    candles_held: int | None = None
 
 
 class StateStore:
     """Thread-local SQLite connections with durable intent and state writes."""
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -121,6 +132,7 @@ class StateStore:
             raise RuntimeError(
                 f"Database schema {version} is newer than supported {self.SCHEMA_VERSION}"
             )
+
         if version == 0:
             connection.executescript(
                 """
@@ -207,6 +219,14 @@ class StateStore:
                     message TEXT NOT NULL,
                     sent_at_utc TEXT
                 );
+                CREATE TABLE starts (
+                    started_at_utc TEXT PRIMARY KEY,
+                    planned INTEGER NOT NULL CHECK (planned IN (0, 1))
+                );
+                CREATE TABLE meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 """
             )
             connection.executemany(
@@ -214,9 +234,9 @@ class StateStore:
                 ((flag,) for flag in _FLAGS),
             )
             connection.execute("INSERT INTO telegram(singleton, last_update_id) VALUES (1, 0)")
-            connection.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
-            connection.commit()
-        elif version == 1:
+            version = 0
+
+        if version < 2:
             trade_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(trades)")
             }
@@ -241,8 +261,34 @@ class StateStore:
                 )
                 """
             )
-            connection.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
-            connection.commit()
+            version = 2
+
+        if version < 3:
+            trade_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(trades)")
+            }
+            if "close_reason" not in trade_columns:
+                connection.execute("ALTER TABLE trades ADD COLUMN close_reason TEXT")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS starts (
+                    started_at_utc TEXT PRIMARY KEY,
+                    planned INTEGER NOT NULL CHECK (planned IN (0, 1))
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            version = 3
+
+        connection.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
+        connection.commit()
 
     def close_thread_connection(self) -> None:
         connection = getattr(self._connections, "connection", None)
@@ -278,10 +324,33 @@ class StateStore:
         if equity <= 0:
             raise ValueError("Baseline equity must be positive")
         with self._connection() as connection:
-            connection.execute(
-                "INSERT OR IGNORE INTO baselines(period, starts_at_utc, equity) VALUES (?, ?, ?)",
-                (period, starts_at_utc, equity),
+            current = connection.execute(
+                "SELECT starts_at_utc FROM baselines WHERE period = ?",
+                (period,),
+            ).fetchone()
+            candidate = datetime.fromisoformat(starts_at_utc)
+            if current is None:
+                connection.execute(
+                    "INSERT INTO baselines(period, starts_at_utc, equity) VALUES (?, ?, ?)",
+                    (period, starts_at_utc, equity),
+                )
+                return
+            previous = datetime.fromisoformat(current["starts_at_utc"])
+            is_new_period = (
+                candidate.date() > previous.date()
+                if period == "day"
+                else (candidate.year, candidate.month)
+                > (previous.year, previous.month)
             )
+            if is_new_period:
+                connection.execute(
+                    """
+                    UPDATE baselines
+                    SET starts_at_utc = ?, equity = ?
+                    WHERE period = ?
+                    """,
+                    (starts_at_utc, equity, period),
+                )
 
     def get_baseline(self, period: Literal["day", "month"]) -> tuple[str, float] | None:
         row = (
@@ -293,6 +362,116 @@ class StateStore:
             .fetchone()
         )
         return None if row is None else (row["starts_at_utc"], row["equity"])
+
+    def open_trades(self) -> tuple[TradeRecord, ...]:
+        rows = self._connection().execute(
+            """
+            SELECT *
+            FROM trades
+            WHERE closed_at_utc IS NULL
+            ORDER BY opened_at_utc, ticket
+            """
+        ).fetchall()
+        return tuple(self._trade_from_row(row) for row in rows)
+
+    def trades(self) -> tuple[TradeRecord, ...]:
+        rows = self._connection().execute(
+            "SELECT * FROM trades ORDER BY opened_at_utc, ticket"
+        ).fetchall()
+        return tuple(self._trade_from_row(row) for row in rows)
+
+    def get_bar_progress(self, symbol: str, timeframe: str) -> str | None:
+        row = self._connection().execute(
+            "SELECT last_open_utc FROM bar_progress WHERE symbol = ? AND timeframe = ?",
+            (symbol, timeframe),
+        ).fetchone()
+        return None if row is None else row["last_open_utc"]
+
+    def realized_pnl_between(self, start_utc: str, end_utc: str) -> float:
+        _validate_utc_timestamp(start_utc, "start_utc")
+        _validate_utc_timestamp(end_utc, "end_utc")
+        if start_utc > end_utc:
+            raise ValueError("start_utc must be earlier than or equal to end_utc")
+        row = self._connection().execute(
+            """
+            SELECT COALESCE(SUM(CASE
+                WHEN closed_at_utc IS NOT NULL
+                 AND closed_at_utc >= ?
+                 AND closed_at_utc <= ?
+                THEN COALESCE(result_r, 0.0) - COALESCE(commission, 0.0)
+                ELSE 0.0
+            END), 0.0) AS pnl
+            FROM trades
+            """,
+            (start_utc, end_utc),
+        ).fetchone()
+        return float(row["pnl"])
+
+    def last_stop_out_utc(self, symbol: str, timeframe: str) -> str | None:
+        row = self._connection().execute(
+            """
+            SELECT MAX(closed_at_utc) AS last_stop_out_utc
+            FROM trades
+            WHERE symbol = ?
+              AND timeframe = ?
+              AND close_reason IN ('STOP_LOSS', 'TIME_STOP')
+            """,
+            (symbol, timeframe),
+        ).fetchone()
+        return None if row is None or row["last_stop_out_utc"] is None else row["last_stop_out_utc"]
+
+    def get_intent(self, intent_id: int) -> IntentRecord:
+        row = self._connection().execute(
+            "SELECT * FROM intents WHERE intent_id = ?",
+            (intent_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Intent {intent_id} does not exist")
+        return self._intent_from_row(row)
+
+    def find_intent_by_key(self, intent_key: str) -> IntentRecord | None:
+        row = self._connection().execute(
+            "SELECT * FROM intents WHERE intent_key = ?",
+            (intent_key,),
+        ).fetchone()
+        return None if row is None else self._intent_from_row(row)
+
+    def record_start(self, at_utc: str, planned: int) -> None:
+        _validate_utc_timestamp(at_utc, "at_utc")
+        if planned not in (0, 1):
+            raise ValueError("planned must be 0 or 1")
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO starts(started_at_utc, planned) VALUES (?, ?)",
+                (at_utc, planned),
+            )
+
+    def unplanned_starts_since(self, since_utc: str) -> int:
+        _validate_utc_timestamp(since_utc, "since_utc")
+        row = self._connection().execute(
+            "SELECT COUNT(*) AS n FROM starts WHERE started_at_utc >= ? AND planned = 0",
+            (since_utc,),
+        ).fetchone()
+        return int(row["n"])
+
+    def set_meta(self, key: str, value: str) -> None:
+        if not key:
+            raise ValueError("Meta key is required")
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
+    def get_meta(self, key: str) -> str | None:
+        if not key:
+            raise ValueError("Meta key is required")
+        row = self._connection().execute(
+            "SELECT value FROM meta WHERE key = ?",
+            (key,),
+        ).fetchone()
+        return None if row is None else row["value"]
 
     def commit_candle_decisions(
         self,
@@ -564,6 +743,44 @@ class StateStore:
             settings_version=row["settings_version"],
         )
 
+    def close_trade(
+        self,
+        ticket: str,
+        closed_at_utc: str,
+        close_price: float,
+        profit: float,
+        commission: float,
+        exit_reason: str | ExitReason,
+    ) -> TradeRecord:
+        if not ticket:
+            raise ValueError("Trade ticket is required")
+        _validate_utc_timestamp(closed_at_utc, "closed_at_utc")
+        reason_value = str(exit_reason)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM trades WHERE ticket = ?",
+                (ticket,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Trade {ticket} does not exist")
+            connection.execute(
+                """
+                UPDATE trades
+                SET closed_at_utc = ?,
+                    close_price = ?,
+                    result_r = ?,
+                    commission = ?,
+                    close_reason = ?
+                WHERE ticket = ?
+                """,
+                (closed_at_utc, close_price, profit, commission, reason_value, ticket),
+            )
+            updated = connection.execute(
+                "SELECT * FROM trades WHERE ticket = ?",
+                (ticket,),
+            ).fetchone()
+        return self._trade_from_row(updated)
+
     def record_equity(self, time_utc: str, balance: float, equity: float) -> None:
         _validate_utc_timestamp(time_utc, "time_utc")
         if balance < 0 or equity < 0:
@@ -599,6 +816,31 @@ class StateStore:
             )
 
     @staticmethod
+    def _trade_from_row(row: sqlite3.Row) -> TradeRecord:
+        return TradeRecord(
+            ticket=row["ticket"],
+            intent_id=row["intent_id"],
+            symbol=row["symbol"],
+            strategy=row["strategy"],
+            timeframe=row["timeframe"],
+            side=row["side"],
+            lots=row["lots"],
+            entry=row["entry"],
+            stop_loss=row["stop_loss"],
+            take_profit=row["take_profit"],
+            actual_risk=row["actual_risk"],
+            opened_at_utc=row["opened_at_utc"],
+            code_version=row["code_version"],
+            settings_version=row["settings_version"],
+            close_reason=row["close_reason"],
+            closed_at_utc=row["closed_at_utc"],
+            close_price=row["close_price"],
+            commission=row["commission"],
+            result_r=row["result_r"],
+            candles_held=row["candles_held"],
+        )
+
+    @staticmethod
     def _intent_from_row(row: sqlite3.Row) -> IntentRecord:
         return IntentRecord(
             intent_id=row["intent_id"],
@@ -609,5 +851,8 @@ class StateStore:
             entry=row["entry"],
             stop_loss=row["stop_loss"],
             take_profit=row["take_profit"],
+            actual_risk=row["actual_risk"],
             status=row["status"],
+            created_at_utc=row["created_at_utc"],
+            ticket=row["ticket"],
         )

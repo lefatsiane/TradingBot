@@ -1,7 +1,7 @@
 schema_version = 1
 
 [account]
-expected_login = 53109385
+expected_login = 0
 expected_server = "ICMarketsSC-Demo"
 mode = "demo"
 allow_live = false

@@ -2,10 +2,28 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from math import isfinite
 
 from bot.core.types import ReasonCode
+
+
+def next_weekend_close_utc(now_utc: datetime, sessions: Iterable[SessionWindow]) -> datetime:
+    """Return the next Friday session close at or after now_utc."""
+    current = _as_utc(now_utc, "now_utc")
+    candidates: list[datetime] = []
+    for session in sessions:
+        if session.weekday != 4:
+            continue
+        friday_date = current.date() + timedelta(days=(4 - current.weekday()) % 7)
+        closes = datetime.combine(friday_date, session.closes_utc, tzinfo=UTC)
+        if closes < current:
+            closes += timedelta(days=7)
+        if closes >= current:
+            candidates.append(closes)
+    if not candidates:
+        raise ValueError("No Friday session window available")
+    return min(candidates)
 
 
 @dataclass(frozen=True, slots=True)

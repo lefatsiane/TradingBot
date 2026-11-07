@@ -21,7 +21,7 @@ def test_store_uses_durable_database_pragmas_and_starts_safe(tmp_path) -> None:
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
     store = StateStore(path)
     store.close_thread_connection()
 
@@ -131,7 +131,7 @@ def test_store_migrates_v1_database_to_outbox_and_audit_columns(tmp_path) -> Non
     store.close_thread_connection()
     store = StateStore(path)
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(trades)").fetchall()
         }
@@ -141,11 +141,67 @@ def test_store_migrates_v1_database_to_outbox_and_audit_columns(tmp_path) -> Non
         ).fetchone()
 
 
+def test_state_store_tracks_trade_closes_and_runtime_meta(tmp_path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    intent = store.create_intent(
+        intent_key="meta-1",
+        symbol="EURUSD",
+        side="long",
+        lots=0.02,
+        entry=1.1,
+        stop_loss=1.09,
+        take_profit=1.12,
+        actual_risk=1.0,
+        created_at_utc="2026-10-26T12:00:00+00:00",
+        code_version="c1",
+        settings_version="s1",
+    )
+    store.transition_intent(intent.intent_id, "SENT")
+    store.transition_intent(intent.intent_id, "UNKNOWN")
+    store.transition_intent(intent.intent_id, "CONFIRMED", ticket="T-100")
+    trade = store.create_trade_from_intent(
+        intent_id=intent.intent_id,
+        ticket="T-100",
+        strategy="A",
+        timeframe="H1",
+        opened_at_utc="2026-10-26T12:10:00+00:00",
+    )
+    assert trade.close_reason is None
+    assert store.get_bar_progress("EURUSD", "H1") is None
+    store.record_start("2026-10-26T12:15:00+00:00", 1)
+    store.set_meta("clean_shutdown", "0")
+    assert store.get_meta("clean_shutdown") == "0"
+    assert store.unplanned_starts_since("2026-10-26T00:00:00+00:00") == 0
+    closed = store.close_trade(
+        "T-100",
+        "2026-10-26T13:00:00+00:00",
+        1.11,
+        0.50,
+        0.05,
+        "TAKE_PROFIT",
+    )
+    assert closed.close_reason == "TAKE_PROFIT"
+    assert store.open_trades() == ()
+    assert store.realized_pnl_between("2026-10-26T12:00:00+00:00", "2026-10-26T13:00:00+00:00") == pytest.approx(0.45)
+    assert store.last_stop_out_utc("EURUSD", "H1") is None
+
+
 def test_baseline_is_written_once(tmp_path) -> None:
     store = StateStore(tmp_path / "state.db")
     store.new_baseline("day", "2026-10-26T00:00:00+00:00", 3_000)
     store.new_baseline("day", "2026-10-26T01:00:00+00:00", 2_990)
     assert store.get_baseline("day") == ("2026-10-26T00:00:00+00:00", 3_000)
+
+
+def test_baseline_rolls_forward_once_at_the_next_period_boundary(tmp_path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.new_baseline("day", "2026-10-26T00:00:00+00:00", 3_000)
+    store.new_baseline("day", "2026-10-26T00:00:00+00:00", 2_900)
+    assert store.get_baseline("day") == ("2026-10-26T00:00:00+00:00", 3_000)
+
+    store.new_baseline("day", "2026-10-27T00:00:00+00:00", 2_950)
+
+    assert store.get_baseline("day") == ("2026-10-27T00:00:00+00:00", 2_950)
 
 
 def test_store_supports_concurrent_thread_writes(tmp_path) -> None:

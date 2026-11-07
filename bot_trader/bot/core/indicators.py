@@ -1,4 +1,4 @@
-﻿"""Technical indicator helpers used throughout the trading bot."""
+"""Technical indicator helpers used throughout the trading bot."""
 
 from __future__ import annotations
 
