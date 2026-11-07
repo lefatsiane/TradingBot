@@ -12,7 +12,7 @@ from bot.adapters.sim_broker import Fault, FaultPlan, SimBroker
 from bot.adapters.store import StateStore
 from bot.app import engine as engine_module
 from bot.app.config import load_settings
-from bot.app.engine import Engine, EntryContext, evaluate_candle
+from bot.app.engine import Engine, EntryContext, _propose, evaluate_candle
 from bot.app.executor import ExecutionResult, Executor
 from bot.app.news import NewsEvent
 from bot.core.clock import SimClock
@@ -70,6 +70,20 @@ def _context(**updates) -> EntryContext:
     }
     values.update(updates)
     return EntryContext(**values)
+
+
+def test_random_control_without_selected_bar_never_falls_back_to_strategy() -> None:
+    context = _context(
+        strategy_mode="a",
+        random_entry_control=True,
+        random_entry_side=None,
+    )
+
+    strategy, result = _propose(context)
+
+    assert strategy == "A"
+    assert result.proposal is None
+    assert result.reason is ReasonCode.NO_TRIGGER
 
 
 @pytest.mark.parametrize(

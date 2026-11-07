@@ -442,8 +442,10 @@ cross-check first, then sensitivity, then the rest stays.
 
 - [x] Bootstrap confidence intervals: 10,000 resamples of whole calendar weeks.
 - [x] Mark-to-market drawdown at every candle close.
-- [ ] Random-entry control: 1,000 runs per strategy with the same trade counts, gates, cooldown,
-  one-position rule and exits.
+- [ ] Random-entry control: `tools/replay.py --random-control` now implements the 1,000-run
+  harness, matching per-instrument counts and applying the engine gates, cooldown, position limits
+  and strategy-specific exits. The 1,000-run acceptance result remains pending reviewed schedules
+  and validated caches.
 - [x] Cost stress: rerun with spreads and slippage doubled (`tools/replay.py --cost-multiplier 2`)
   and compare matching reports with `tools/stats.py --cost-stress-report`.
 - [x] Per-instrument, per-timeframe and combined A+B reports (`portfolio_breakdown.csv` records
@@ -464,11 +466,15 @@ confidence intervals, and a versioned/date-ranged scorecard. The replay cost mul
 doubled spreads and slippage; the scorecard compares only matching baseline/stress reports. The
 one-time `--final` lock is exclusive and records the code version. Replay reports now include trade
 attribution and per-instrument/timeframe plus combined A+B totals. Variant trials can be recorded in
-`data/reports/variants.json`. `tools/replay.py --sensitivity` now varies each numeric A/B strategy
+`data/reports/variants.json`. `tools/replay.py --random-control` now generates random time/side
+controls, reruns through the engine, retries to match baseline instrument counts, and compares mean
+closed-trade R expectancy with the random 95th percentile. The 1,000-run acceptance result remains
+blocked until the owner applies reviewed schedules and supplies validated caches.
+`tools/replay.py --sensitivity` now varies each numeric A/B strategy
 parameter by about +/-20%, passes the parameter objects directly into the engine-backed replay,
 writes variant summaries, and records completed runs. The sensitivity acceptance runs remain open
-until run against reviewed schedules and validated caches. Random-entry controls remain open and
-must not be inferred from the current scorecard.
+until run against reviewed schedules and validated caches. Neither control result should be inferred
+from the current scorecard.
 
 ---
 

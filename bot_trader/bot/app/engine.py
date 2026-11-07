@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from math import isfinite
@@ -17,6 +17,10 @@ from bot.app.news import (
     calendar_has_minimum_coverage,
     is_news_blocked,
     load_news_calendar,
+)
+from bot.app.random_control import (
+    RandomEntryKey,
+    propose_random_entry,
 )
 from bot.core.clock import Clock
 from bot.core.gates import (
@@ -100,6 +104,8 @@ class EntryContext:
     strategy_mode: Literal["a", "b", "both"] = "both"
     strategy_a_params: StrategyAParams | None = None
     strategy_b_params: StrategyBParams | None = None
+    random_entry_control: bool = False
+    random_entry_side: Side | None = None
     stop_new: bool = False
     halted_daily: bool = False
     halted_monthly: bool = False
@@ -313,6 +319,33 @@ def _gate(
 def _propose(context: EntryContext) -> tuple[str, StrategyResult]:
     params_a = context.strategy_a_params or context.settings.strategy_a.to_params()
     params_b = context.strategy_b_params or context.settings.strategy_b.to_params()
+    if context.random_entry_control:
+        if context.random_entry_side is None:
+            return (
+                ("A" if context.strategy_mode == "a" else "B"),
+                StrategyResult(None, ReasonCode.NO_TRIGGER),
+            )
+        if context.strategy_mode == "a":
+            return (
+                "A",
+                propose_random_entry(
+                    context.candles,
+                    "a",
+                    context.random_entry_side,
+                    params_a,
+                ),
+            )
+        if context.strategy_mode == "b":
+            return (
+                "B",
+                propose_random_entry(
+                    context.candles,
+                    "b",
+                    context.random_entry_side,
+                    params_b,
+                ),
+            )
+        raise ValueError("Random-entry control requires a single strategy mode")
     if context.strategy_mode == "a":
         if context.timeframe in context.settings.strategy_a.timeframes:
             return "A", propose_a(context.candles, params_a)
@@ -466,9 +499,19 @@ class Engine:
         strategy_mode: Literal["a", "b", "both"] = "both",
         strategy_a_params: StrategyAParams | None = None,
         strategy_b_params: StrategyBParams | None = None,
+        random_entry_schedule: Mapping[RandomEntryKey, Side] | None = None,
+        random_entry_targets: Mapping[str, int] | None = None,
     ) -> None:
         if strategy_mode not in ("a", "b", "both"):
             raise ValueError("strategy_mode must be 'a', 'b', or 'both'")
+        if (random_entry_schedule is None) != (random_entry_targets is None):
+            raise ValueError("Random-entry schedule and targets must be provided together")
+        if random_entry_schedule is not None and strategy_mode == "both":
+            raise ValueError("Random-entry control requires a single strategy mode")
+        if random_entry_targets is not None and any(
+            target < 0 for target in random_entry_targets.values()
+        ):
+            raise ValueError("Random-entry targets cannot be negative")
         self._settings = settings
         self._gateway = gateway
         self._store = store
@@ -481,6 +524,9 @@ class Engine:
         self._strategy_mode = strategy_mode
         self._strategy_a_params = strategy_a_params
         self._strategy_b_params = strategy_b_params
+        self._random_entry_schedule = random_entry_schedule or {}
+        self._random_entry_remaining = dict(random_entry_targets or {})
+        self._random_entry_control = random_entry_schedule is not None
         self._news_events: tuple[NewsEvent, ...] = ()
         self._news_calendar_valid: bool | None = None
         self._instance_lock_file: BinaryIO | None = None
@@ -565,6 +611,12 @@ class Engine:
                         strategy_mode=self._strategy_mode,
                         strategy_a_params=self._strategy_a_params,
                         strategy_b_params=self._strategy_b_params,
+                        random_entry_control=self._random_entry_control,
+                        random_entry_side=(
+                            self._random_entry_schedule.get((symbol, timeframe, newest.time))
+                            if self._random_entry_remaining.get(symbol, 0) > 0
+                            else None
+                        ),
                         bars_since_stop=self._bars_since_stop(
                             symbol, timeframe, window
                         ),
@@ -658,6 +710,8 @@ class Engine:
                                     indicators=decision.indicators,
                                 )
                             else:
+                                if context.random_entry_side is not None:
+                                    self._random_entry_remaining[symbol] -= 1
                                 accepted_risks.append(
                                     OpenRisk(
                                         symbol,

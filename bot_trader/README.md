@@ -231,7 +231,23 @@ otherwise it remains `INCONCLUSIVE` rather than assigning a misleading
 percentage.
 
 The scorecard leaves missing cost-stress, parity, and restart evidence
-`INCONCLUSIVE`. Run parameter sensitivity on both strategies with:
+`INCONCLUSIVE`. Run the random-entry control (1,000 trials per strategy by
+default) with:
+
+```powershell
+python tools/replay.py --settings settings.toml --strategy both --no-news --random-control
+```
+
+The control samples random bar times and long/short sides after each strategy's
+warm-up, uses that strategy's stop/target and management exits, and submits
+entries through the same engine gates, risk checks, cooldown, and position
+limits. It retries a trial until per-instrument entry counts match the baseline,
+up to 20 schedules per trial. The JSON report compares mean closed-trade R
+expectancy against the random trials' 95th percentile; any count mismatch or
+missing expectancy leaves the comparison `INCONCLUSIVE`. This can be a
+computationally expensive run.
+
+Run parameter sensitivity on both strategies with:
 
 ```powershell
 python tools/replay.py --settings settings.toml --strategy both --no-news --sensitivity
@@ -241,7 +257,7 @@ This writes one replay report per valid +/-20 percent parameter variant, a
 `sensitivity-*.csv` index, and records completed variants in
 `data/reports/variants.json`. Invalid parameter combinations are listed rather
 than silently skipped. The engine's 1,000-candle input cap still applies.
-Random-entry controls remain unimplemented. Replay `portfolio_breakdown.csv` reports strategy,
+Replay `portfolio_breakdown.csv` reports strategy,
 symbol/timeframe, and overall combined totals.
 
 Record a unique strategy variant before running it so the attempt count stays

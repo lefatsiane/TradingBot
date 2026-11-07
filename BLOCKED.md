@@ -47,8 +47,11 @@
 - `tools/stats.py` computes candle-close drawdown, 10,000-resample calendar-week confidence
   intervals, doubled-cost stress comparisons, and a date/versioned scorecard. Replay reports
   contain instrument/timeframe and combined A+B trade totals. The `--final` replay lock is exclusive
-  and records the code version. The variant ledger records unique trial IDs. Random-entry controls
-  are not implemented. `tools/replay.py --sensitivity` now runs +/-20 percent numeric-parameter
+  and records the code version. The variant ledger records unique trial IDs.
+  `tools/replay.py --random-control` implements random time/side candidates with strategy exits and
+  retries to match per-instrument baseline counts; the required 1,000-run acceptance result cannot
+  be produced until reviewed schedules and validated caches are available.
+  `tools/replay.py --sensitivity` runs +/-20 percent numeric-parameter
   variants and records result indexes, but acceptance runs remain blocked until the owner applies
   reviewed schedules and supplies validated caches. Absent scorecard evidence is `INCONCLUSIVE`.
 
