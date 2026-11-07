@@ -10,3 +10,5 @@ backups/
 *.db-shm
 *.db-wal
 .env
+config/news_input*.csv
+!config/news_input.template.csv
