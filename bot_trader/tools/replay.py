@@ -24,6 +24,7 @@ from bot.app.replay_runner import (
 from bot.app.versioning import get_version
 from bot.core.strategy_a import StrategyAParams
 from bot.core.strategy_b import StrategyBParams
+from tools.random_control import run_random_entry_control
 from tools.stats import record_variant
 
 
@@ -61,6 +62,23 @@ def main() -> None:
         "--sensitivity",
         action="store_true",
         help="Rerun selected strategies with each numeric parameter varied by about 20 percent.",
+    )
+    parser.add_argument(
+        "--random-control",
+        action="store_true",
+        help="Run the 1,000-run random-entry control for the selected strategy or both.",
+    )
+    parser.add_argument(
+        "--random-runs",
+        type=int,
+        default=1_000,
+        help="Random-entry runs per strategy (default: 1000).",
+    )
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=0,
+        help="Seed for reproducible random-entry schedules (default: 0).",
     )
     args = parser.parse_args()
 
@@ -107,6 +125,29 @@ def main() -> None:
     try:
         version = get_version(PROJECT_ROOT)
         code_version = version.commit + ("-dirty" if not version.clean else "")
+        if args.random_control:
+            if args.final or args.sensitivity:
+                parser.error("--random-control cannot be combined with --final or --sensitivity")
+            strategies = (
+                ("a", "b") if args.strategy == "both" else (args.strategy,)
+            )
+            report_path = run_random_entry_control(
+                histories,
+                specs,
+                settings,
+                strategies=strategies,
+                now_utc=now,
+                starting_equity=args.starting_equity,
+                no_news=args.no_news,
+                report_root=reports_dir,
+                code_version=code_version,
+                settings_version=settings_version,
+                cost_multiplier=args.cost_multiplier,
+                runs=args.random_runs,
+                seed=args.random_seed,
+            )
+            print(f"Saved random-entry control: {report_path}")
+            return
         if args.sensitivity:
             if args.final:
                 parser.error("--sensitivity cannot be combined with --final")

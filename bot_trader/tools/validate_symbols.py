@@ -10,7 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from bot.adapters.mt5_broker import MT5Broker
-from bot.app.config import load_runtime_secrets, load_settings
+from bot.app.config import load_runtime_secrets, load_settings, schedule_season_for_utc
 from bot.app.symbol_validation import SymbolValidationReport, validate_symbol, write_hours_utc
 
 
@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--write",
         action="store_true",
-        help="Write suggested hours_utc values for passing symbols only.",
+        help="Write suggested hours_utc values and their reviewed season for passing symbols.",
     )
     args = parser.parse_args(argv)
     settings_path = Path(args.settings).resolve()
@@ -90,7 +90,11 @@ def main(argv: list[str] | None = None) -> int:
             if report.passed
         }
         try:
-            write_hours_utc(settings_path, passing_schedules)
+            write_hours_utc(
+                settings_path,
+                passing_schedules,
+                schedule_season_for_utc(now_utc),
+            )
         except (OSError, ValueError) as error:
             print(f"Could not write UTC schedules: {error}", file=sys.stderr)
             return 2
@@ -122,7 +126,10 @@ def _print_reports(reports: list[SymbolValidationReport]) -> None:
         for issue in report.issues:
             print(f"  - {issue}")
         if report.suggested_hours_utc:
-            print(f"  suggested hours_utc = {report.suggested_hours_utc}")
+            print(
+                f"  suggested hours_utc = {report.suggested_hours_utc} "
+                f"(reviewed in {report.suggested_hours_utc_season})"
+            )
 
 
 if __name__ == "__main__":

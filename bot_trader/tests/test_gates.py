@@ -4,6 +4,7 @@ from datetime import UTC, datetime, time
 
 import pytest
 
+from bot.app.config import parse_sessions
 from bot.core.gates import SessionWindow, evaluate_entry_gates
 from bot.core.types import ReasonCode
 
@@ -175,6 +176,30 @@ def test_overnight_session_matches_previous_weekday_after_midnight() -> None:
     assert evening.allowed
     assert early_morning.allowed
     assert session_close.reason is ReasonCode.OUTSIDE_HOURS
+
+
+def test_24_hour_session_end_and_next_day_open_are_exclusive_and_contiguous() -> None:
+    sunday_session = parse_sessions(("sun 22:01-24:00",))
+    contiguous_sessions = parse_sessions(
+        ("sun 22:01-24:00", "mon 00:00-21:59")
+    )
+    at_midnight = datetime(2026, 10, 26, 0, 0, tzinfo=UTC)
+
+    closed = evaluate_entry_gates(
+        **gate_inputs(
+            at_utc=at_midnight,
+            sessions=sunday_session,
+        )
+    )
+    reopened = evaluate_entry_gates(
+        **gate_inputs(
+            at_utc=at_midnight,
+            sessions=contiguous_sessions,
+        )
+    )
+
+    assert closed.reason is ReasonCode.OUTSIDE_HOURS
+    assert reopened.allowed
 
 
 def test_gate_rejects_non_finite_measurements() -> None:

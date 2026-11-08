@@ -174,8 +174,9 @@ and optional Telegram/heartbeat threads. `Broker` is a `Protocol`;
 `MT5ReadOnlyBroker` implements candle, symbol-specification, tick, and
 connection/shutdown operations needed by history caching. `MT5Broker` separately
 implements account/position/order operations with a non-demo refusal guard.
-Its fake-API tests pass, but its real demo-terminal behavior and tick-derived
-offset have not been verified; see `../BLOCKED.md` and `../QUESTIONS.md`.
+Its fake-API tests pass, but its real demo-terminal behavior and the owner's
+weekday visual cross-check of the confirmed New York-plus-seven-hour offset
+have not been verified; see `../BLOCKED.md` and `../QUESTIONS.md`.
 `SimBroker` is the simulated implementation; its deterministic fault plan
 supports order and tick failure scenarios for tests. `Engine` accepts a
 context factory and processes closed bars; `run_management_lane()` performs
@@ -244,7 +245,7 @@ demo acceptance and the engine's full replay acceptance criteria remain open.
   Wilder smoothing/ATR, Bollinger bands, RSI, and ADX.
 - `bot/core/strategy_a.py`: pure Strategy A proposal generation from closed
   candles and explicit `StrategyAParams`; settings convert through
-  `StrategyASettings.to_params()`. Defaults use a 600-candle warm-up and 1,000
+  `StrategyASettings.to_params()`. Defaults use a 300-candle warm-up and 1,000
   candle window. Checks parameterized trend/pullback/trigger rules and builds an
   ATR-based stop and configured R-multiple target.
 - `bot/core/strategy_b.py`: fixed H1-only quiet-market mean-reversion proposal;

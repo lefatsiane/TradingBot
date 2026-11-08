@@ -7,7 +7,8 @@ import re
 import tomllib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import time
+from datetime import UTC, datetime, time
+from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -17,6 +18,7 @@ from bot.adapters.broker import BrokerAccount
 from bot.core.gates import SessionWindow
 from bot.core.strategy_a import StrategyAParams
 from bot.core.strategy_b import StrategyBParams
+from bot.core.timeutil import expected_new_york_offset
 
 if TYPE_CHECKING:
     from bot.adapters.sim_broker import SimCosts
@@ -27,7 +29,6 @@ class StrictModel(BaseModel):
 
 
 ALLOW_RISK_LIMIT_INCREASES = False
-# DECISION-PENDING: keep these approved caps until the owner decides if they may be raised.
 _APPROVED_RISK_LIMITS = {
     "risk_per_trade_pct": 0.5,
     "daily_loss_pct": 1.0,
@@ -57,7 +58,6 @@ class RiskSettings(StrictModel):
     max_open_trades: int = Field(ge=1, le=100)
     cost_gate_pct_of_risk: float = Field(gt=0, le=100)
     max_margin_used_pct: float = Field(gt=0, le=100)
-    # DECISION-PENDING: this cooldown is measured in closed bars of its timeframe.
     cooldown_bars_after_stop: int = Field(ge=0, le=1_000)
 
     @model_validator(mode="after")
@@ -76,7 +76,6 @@ class TimingSettings(StrictModel):
     fast_tick_s: int = Field(ge=1, le=2)
     candle_poll_s: int = Field(ge=1, le=5)
     no_new_entries_before_weekend_close_min: int = Field(ge=120)
-    # DECISION-PENDING: confirm the Friday session end as the flatten reference.
     flatten_before_weekend_close_min: int = Field(ge=30)
     rollover_block_before_min: int = Field(ge=10)
     rollover_block_after_min: int = Field(ge=30)
@@ -113,8 +112,12 @@ _DAY_INDEX = {
     "sat": 5,
     "sun": 6,
 }
-# DECISION-PENDING: confirm this weekday-window string format with the owner.
-_HOURS_UTC_RE = re.compile(r"^(mon|tue|wed|thu|fri|sat|sun)\s+(\d{2}:\d{2})-(\d{2}:\d{2})$", re.IGNORECASE)
+_TIME_UTC = r"(?:[01]\d|2[0-3]):[0-5]\d"
+_HOURS_UTC_RE = re.compile(
+    rf"^(mon|tue|wed|thu|fri|sat|sun)\s+({_TIME_UTC})-({_TIME_UTC}|24:00)$",
+    re.IGNORECASE,
+)
+ScheduleSeason = Literal["US winter", "US summer"]
 
 
 def parse_sessions(hours: tuple[str, ...]) -> tuple[SessionWindow, ...]:
@@ -125,40 +128,145 @@ def parse_sessions(hours: tuple[str, ...]) -> tuple[SessionWindow, ...]:
             raise ValueError(f"Invalid hours_utc session: {raw!r}; expected 'mon 00:00-21:55'")
         weekday_name, start_text, end_text = match.groups()
         start = time.fromisoformat(start_text)
-        end = time.fromisoformat(end_text)
-        if start >= end:
+        end_of_day = end_text == "24:00"
+        end = time(0) if end_of_day else time.fromisoformat(end_text)
+        if start >= end and not end_of_day:
             raise ValueError(f"Invalid session window {raw!r}; end time must be after start time")
         weekday = _DAY_INDEX[weekday_name.lower()]
-        sessions.append(SessionWindow(weekday=weekday, opens_utc=start, closes_utc=end))
+        sessions.append(
+            SessionWindow(
+                weekday=weekday,
+                opens_utc=start,
+                closes_utc=end,
+                full_day=end_of_day and start == time(0),
+            )
+        )
     return tuple(sessions)
 
 
-def schedule_validation_failures(settings: Settings) -> tuple[str, ...]:
+def session_windows_overlap(sessions: Iterable[SessionWindow]) -> bool:
+    week_minutes = 7 * 24 * 60
+    intervals: list[tuple[int, int]] = []
+    for session in sessions:
+        start = (
+            session.weekday * 24 * 60
+            + session.opens_utc.hour * 60
+            + session.opens_utc.minute
+        )
+        end_minute = session.closes_utc.hour * 60 + session.closes_utc.minute
+        duration = (
+            24 * 60
+            if session.full_day
+            else end_minute
+            - (session.opens_utc.hour * 60 + session.opens_utc.minute)
+        )
+        if duration < 0:
+            duration += 24 * 60
+        end = start + duration
+        if end <= week_minutes:
+            intervals.append((start, end))
+        else:
+            intervals.extend(((start, week_minutes), (0, end - week_minutes)))
+    intervals.sort()
+    return any(
+        current[0] < previous[1]
+        for previous, current in pairwise(intervals)
+    )
+
+
+def schedule_season_for_utc(utc_time: datetime) -> ScheduleSeason:
+    return (
+        "US summer"
+        if expected_new_york_offset(utc_time) == 3
+        else "US winter"
+    )
+
+
+def sessions_for_utc(
+    hours: tuple[str, ...],
+    reviewed_season: ScheduleSeason | None,
+    at_utc: datetime,
+) -> tuple[SessionWindow, ...]:
+    sessions = parse_sessions(hours)
+    if reviewed_season not in ("US winter", "US summer"):
+        raise ValueError("A reviewed US season is required to resolve the UTC schedule")
+    reviewed_offset = 3 if reviewed_season == "US summer" else 2
+    active_offset = expected_new_york_offset(at_utc)
+    shift_minutes = (reviewed_offset - active_offset) * 60
+    if shift_minutes == 0:
+        return sessions
+
+    shifted: list[SessionWindow] = []
+    for session in sessions:
+        start_minute = session.opens_utc.hour * 60 + session.opens_utc.minute
+        end_minute = session.closes_utc.hour * 60 + session.closes_utc.minute
+        duration = (
+            24 * 60
+            if session.full_day
+            else end_minute - start_minute
+        )
+        if duration < 0:
+            duration += 24 * 60
+        week_start = (
+            session.weekday * 24 * 60 + start_minute + shift_minutes
+        ) % (7 * 24 * 60)
+        weekday, opens = divmod(week_start, 24 * 60)
+        closes = (opens + duration) % (24 * 60)
+        shifted.append(
+            SessionWindow(
+                weekday,
+                time(opens // 60, opens % 60),
+                time(closes // 60, closes % 60),
+                full_day=duration == 24 * 60,
+            )
+        )
+    return tuple(sorted(shifted, key=lambda session: (session.weekday, session.opens_utc)))
+
+
+def schedule_validation_failures(
+    settings: Settings,
+    *,
+    now_utc: datetime | None = None,
+) -> tuple[str, ...]:
     failures: list[str] = []
+    current_utc = datetime.now(tz=UTC) if now_utc is None else now_utc
     for symbol, symbol_settings in settings.symbols.items():
         if not symbol_settings.enabled:
             continue
         if not symbol_settings.hours_utc:
             failures.append(f"{symbol}: hours_utc is empty")
             continue
+        if symbol_settings.hours_utc_season is None:
+            failures.append(f"{symbol}: hours_utc_season is missing")
         try:
-            sessions = parse_sessions(symbol_settings.hours_utc)
+            sessions = (
+                parse_sessions(symbol_settings.hours_utc)
+                if symbol_settings.hours_utc_season is None
+                else sessions_for_utc(
+                    symbol_settings.hours_utc,
+                    symbol_settings.hours_utc_season,
+                    current_utc,
+                )
+            )
         except ValueError as error:
             failures.append(f"{symbol}: {error}")
             continue
-        if not any(session.weekday == 4 for session in sessions):
+        if not any(
+            session.weekday == 4
+            or (
+                session.weekday
+                + int(
+                    session.full_day
+                    or session.closes_utc < session.opens_utc
+                )
+            )
+            % 7
+            == 4
+            for session in sessions
+        ):
             failures.append(f"{symbol}: hours_utc has no Friday session")
-        for index, current in enumerate(sessions):
-            for other in sessions[index + 1 :]:
-                if (
-                    current.weekday == other.weekday
-                    and current.opens_utc < other.closes_utc
-                    and other.opens_utc < current.closes_utc
-                ):
-                    failures.append(
-                        f"{symbol}: overlapping {current.weekday} UTC sessions"
-                    )
-                    break
+        if session_windows_overlap(sessions):
+            failures.append(f"{symbol}: overlapping UTC sessions")
     return tuple(failures)
 
 
@@ -168,10 +276,13 @@ class SymbolSettings(StrictModel):
     slippage_points: float = Field(ge=0)
     max_spread_points: float = Field(gt=0)
     hours_utc: tuple[str, ...] = ()
+    hours_utc_season: ScheduleSeason | None = None
 
     @model_validator(mode="after")
     def validate_hours_utc(self) -> SymbolSettings:
         parse_sessions(self.hours_utc)
+        if self.hours_utc and self.hours_utc_season is None:
+            raise ValueError("hours_utc_season is required for a reviewed schedule")
         return self
 
 
@@ -188,7 +299,7 @@ class StrategyASettings(StrictModel):
     min_stop_atr: float = 1.0
     max_stop_atr: float = 3.0
     take_profit_r: float = 2.0
-    min_candles: int = 600
+    min_candles: int = 300
     window_candles: int = 1_000
     cooldown_bars_after_stop: int = 6
 
@@ -207,7 +318,7 @@ class StrategyASettings(StrictModel):
             "min_stop_atr": 1.0,
             "max_stop_atr": 3.0,
             "take_profit_r": 2.0,
-            "min_candles": 600,
+            "min_candles": 300,
             "window_candles": 1_000,
             "cooldown_bars_after_stop": 6,
         }

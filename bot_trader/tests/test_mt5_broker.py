@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import bot.adapters.mt5_broker as mt5_module
 from bot.adapters.broker import OrderRequest
 from bot.adapters.mt5_broker import MT5Broker, MT5ReadOnlyBroker
 from bot.core.types import Side
@@ -101,9 +102,15 @@ def test_mt5_adapter_maps_symbol_candles_spread_and_tick_to_utc() -> None:
     assert spec.contract_size == 100_000
     assert candles[0].spread == pytest.approx(0.0001)
     assert candles[0].tick_volume == 123
-    assert candles[0].time == datetime.fromtimestamp(1_767_620_400, tz=UTC)
+    assert candles[0].time == datetime.fromtimestamp(
+        1_767_620_400 - 2 * 60 * 60,
+        tz=UTC,
+    )
     assert tick is not None
-    assert tick.time_utc == datetime.fromtimestamp(1_767_620_400.25, tz=UTC)
+    assert tick.time_utc == datetime.fromtimestamp(
+        1_767_620_400.25 - 2 * 60 * 60,
+        tz=UTC,
+    )
     assert api.range_requests == [("EURUSD", api.TIMEFRAME_H1, start, end)]
 
 
@@ -125,30 +132,31 @@ def test_mt5_adapter_fetches_long_ranges_in_bounded_chunks() -> None:
     assert len(candles) == 1
 
 
-def test_mt5_adapter_rejects_bad_timeframe_and_missing_broker_offset() -> None:
-    broker = MT5ReadOnlyBroker(api=FakeMT5())
+def test_mt5_adapter_rejects_bad_timeframe() -> None:
+    broker = MT5ReadOnlyBroker(
+        api=FakeMT5(),
+        clock=lambda: datetime(2026, 1, 5, tzinfo=UTC),
+    )
 
     with pytest.raises(ValueError, match="timeframe"):
         broker.candles("EURUSD", "M15")
-    with pytest.raises(RuntimeError, match="does not expose"):
-        broker.server_utc_offset_hours()
 
 
-def test_mt5_adapter_uses_explicit_broker_offset_provider() -> None:
-    broker = MT5ReadOnlyBroker(api=FakeMT5(), server_offset_provider=lambda: 2)
+@pytest.mark.parametrize(
+    ("utc_time", "expected_offset"),
+    [
+        (datetime(2026, 10, 25, 12, tzinfo=UTC), 3),
+        (datetime(2026, 11, 1, 12, tzinfo=UTC), 2),
+        (datetime(2027, 3, 14, 12, tzinfo=UTC), 3),
+    ],
+)
+def test_mt5_readonly_adapter_uses_new_york_server_rule(
+    utc_time: datetime,
+    expected_offset: int,
+) -> None:
+    broker = MT5ReadOnlyBroker(api=FakeMT5(), clock=lambda: utc_time)
 
-    assert broker.server_utc_offset_hours() == 2
-
-
-@pytest.mark.parametrize("offset", [-13, 15, True, 2.5])
-def test_mt5_adapter_rejects_invalid_reported_server_offset(offset: object) -> None:
-    broker = MT5ReadOnlyBroker(
-        api=FakeMT5(),
-        server_offset_provider=lambda: offset,
-    )
-
-    with pytest.raises(ValueError, match="offset"):
-        broker.server_utc_offset_hours()
+    assert broker.server_utc_offset_hours() == expected_offset
 
 
 def test_mt5_adapter_rejects_naive_history_range() -> None:
@@ -227,6 +235,8 @@ class FakeLiveMT5API:
             bid=1.1,
             ask=1.1001,
         )
+        self.tick_responses: list[SimpleNamespace] = []
+        self.tick_requests = 0
         self._info = SimpleNamespace(
             currency_base="EUR",
             currency_profit="USD",
@@ -292,6 +302,9 @@ class FakeLiveMT5API:
 
     def symbol_info_tick(self, symbol: str) -> SimpleNamespace:
         assert symbol == "EURUSD"
+        self.tick_requests += 1
+        if self.tick_responses:
+            return self.tick_responses.pop(0)
         return self._tick
 
     def copy_rates_range(
@@ -607,7 +620,7 @@ def test_mt5_broker_converts_symbol_sessions_to_utc_and_splits_midnight() -> Non
     }
     broker = MT5Broker(
         api=api,
-        server_offset_provider=lambda: 2,
+        server_clock_sanity_provider=lambda: 2,
     )
 
     assert broker.symbol_sessions_utc("EURUSD") == (
@@ -618,7 +631,10 @@ def test_mt5_broker_converts_symbol_sessions_to_utc_and_splits_midnight() -> Non
 
 
 def test_mt5_broker_rejects_symbols_without_trading_sessions() -> None:
-    broker = MT5Broker(api=FakeLiveMT5API(), server_offset_provider=lambda: 2)
+    broker = MT5Broker(
+        api=FakeLiveMT5API(),
+        server_clock_sanity_provider=lambda: 2,
+    )
 
     with pytest.raises(RuntimeError, match="no trading sessions"):
         broker.symbol_sessions_utc("EURUSD")
@@ -765,7 +781,7 @@ def test_mt5_broker_modifies_stops_for_the_requested_position() -> None:
 
 def test_mt5_broker_converts_position_server_time_using_reported_offset() -> None:
     api = FakeLiveMT5API()
-    broker = MT5Broker(api=api, server_offset_provider=lambda: 2)
+    broker = MT5Broker(api=api, server_clock_sanity_provider=lambda: 2)
 
     positions = broker.positions(712345)
 
@@ -793,7 +809,7 @@ def test_mt5_broker_converts_deal_server_time_using_reported_offset() -> None:
             comment="1001",
         )
     )
-    broker = MT5Broker(api=api, server_offset_provider=lambda: 2)
+    broker = MT5Broker(api=api, server_clock_sanity_provider=lambda: 2)
 
     deals = broker.history_deals(datetime(2026, 1, 1, tzinfo=UTC), 712345)
 
@@ -808,19 +824,22 @@ def test_mt5_broker_converts_deal_server_time_using_reported_offset() -> None:
 def test_mt5_broker_infers_offset_from_fresh_server_tick() -> None:
     api = FakeLiveMT5API()
     now = datetime(2026, 1, 5, 13, 40, tzinfo=UTC)
-    server_epoch = int(now.timestamp()) + 2 * 60 * 60
-    api._tick = SimpleNamespace(
-        time=server_epoch,
-        time_msc=server_epoch * 1000,
-        bid=1.1,
-        ask=1.1001,
-    )
+    server_time_msc = int((now.timestamp() + 2 * 60 * 60) * 1_000)
+    api.tick_responses = [
+        SimpleNamespace(
+            time=server_time_msc // 1_000,
+            time_msc=server_time_msc + index * 250,
+            bid=1.1,
+            ask=1.1001,
+        )
+        for index in range(3)
+    ]
     broker = MT5Broker(api=api, clock=lambda: now)
 
     assert broker.server_utc_offset_hours() == 2
 
 
-def test_mt5_broker_rejects_stale_server_tick_after_offset_adjustment() -> None:
+def test_mt5_broker_reports_stale_sanity_tick_without_changing_offset(monkeypatch) -> None:
     api = FakeLiveMT5API()
     now = datetime(2026, 1, 5, 13, 40, tzinfo=UTC)
     server_epoch = int(now.timestamp()) + 2 * 60 * 60 + 61
@@ -830,18 +849,80 @@ def test_mt5_broker_rejects_stale_server_tick_after_offset_adjustment() -> None:
         bid=1.1,
         ask=1.1001,
     )
-    broker = MT5Broker(api=api, clock=lambda: now)
+    mismatches: list[str] = []
+    broker = MT5Broker(
+        api=api,
+        clock=lambda: now,
+        on_server_clock_mismatch=mismatches.append,
+    )
+    monkeypatch.setattr(mt5_module.time, "sleep", lambda _: None)
 
-    with pytest.raises(RuntimeError, match="Fresh EURUSD server tick"):
-        broker.server_utc_offset_hours()
+    assert broker.server_utc_offset_hours() == 2
+    assert len(mismatches) == 1
+    assert "stale" in mismatches[0]
+
+
+def test_mt5_broker_uses_new_york_rule_and_advancing_ticks_for_sanity() -> None:
+    api = FakeLiveMT5API()
+    now = datetime(2026, 1, 5, 13, 40, tzinfo=UTC)
+    server_time_msc = int((now.timestamp() + 2 * 60 * 60) * 1_000)
+    api.tick_responses = [
+        SimpleNamespace(
+            time=server_time_msc // 1_000,
+            time_msc=server_time_msc + index * 250,
+            bid=1.1,
+            ask=1.1001,
+        )
+        for index in range(3)
+    ]
+    mismatches: list[str] = []
+    broker = MT5Broker(
+        api=api,
+        clock=lambda: now,
+        on_server_clock_mismatch=mismatches.append,
+    )
+
+    assert broker.server_utc_offset_hours() == 2
+    assert mismatches == []
+    assert api.tick_requests == 3
+
+
+def test_mt5_broker_keeps_new_york_offset_and_reports_tick_mismatch() -> None:
+    api = FakeLiveMT5API()
+    now = datetime(2026, 1, 5, 13, 40, tzinfo=UTC)
+    server_time_msc = int((now.timestamp() + 3 * 60 * 60) * 1_000)
+    api.tick_responses = [
+        SimpleNamespace(
+            time=server_time_msc // 1_000,
+            time_msc=server_time_msc + index * 250,
+            bid=1.1,
+            ask=1.1001,
+        )
+        for index in range(3)
+    ]
+    mismatches: list[str] = []
+    broker = MT5Broker(
+        api=api,
+        clock=lambda: now,
+        on_server_clock_mismatch=mismatches.append,
+    )
+
+    assert broker.server_utc_offset_hours() == 2
+    assert len(mismatches) == 1
+    assert "UTC+3" in mismatches[0]
 
 
 @pytest.mark.parametrize("offset", [-13, 15, True, 2.5])
-def test_mt5_broker_rejects_invalid_explicit_server_offset(offset: object) -> None:
+def test_mt5_broker_keeps_expected_offset_for_invalid_sanity_value(
+    offset: object,
+) -> None:
+    mismatches: list[str] = []
     broker = MT5Broker(
         api=FakeLiveMT5API(),
-        server_offset_provider=lambda: offset,
+        server_clock_sanity_provider=lambda: offset,
+        on_server_clock_mismatch=mismatches.append,
+        clock=lambda: datetime(2026, 1, 5, 13, 40, tzinfo=UTC),
     )
 
-    with pytest.raises(ValueError, match="offset"):
-        broker.server_utc_offset_hours()
+    assert broker.server_utc_offset_hours() == 2
+    assert len(mismatches) == 1

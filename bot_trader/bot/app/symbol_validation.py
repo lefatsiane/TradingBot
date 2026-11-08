@@ -5,11 +5,16 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from itertools import pairwise
 from pathlib import Path
 
 from bot.adapters.broker import Broker
-from bot.app.config import SymbolSettings, parse_sessions
+from bot.app.config import (
+    ScheduleSeason,
+    SymbolSettings,
+    parse_sessions,
+    schedule_season_for_utc,
+    session_windows_overlap,
+)
 from bot.app.data import DataQualityError, validate_candles
 from bot.core.indicators import atr
 from bot.core.sizing import size_trade
@@ -30,6 +35,7 @@ class SymbolValidationReport:
     history_bars: int
     max_observed_spread_points: float | None
     suggested_hours_utc: tuple[str, ...]
+    suggested_hours_utc_season: ScheduleSeason | None
     issues: tuple[str, ...]
 
 
@@ -52,7 +58,9 @@ def validate_symbol(
     try:
         spec = broker.symbol_info(symbol)
     except (OSError, RuntimeError, ValueError) as error:
-        return _report(symbol, settings.enabled, 0, None, (), (f"symbol spec: {error}",))
+        return _report(
+            symbol, settings.enabled, 0, None, (), None, (f"symbol spec: {error}",)
+        )
 
     try:
         tick = broker.tick(symbol)
@@ -118,9 +126,11 @@ def validate_symbol(
         )
 
     suggested_hours: tuple[str, ...] = ()
+    suggested_season: ScheduleSeason | None = None
     try:
         suggested_hours = broker.symbol_sessions_utc(symbol)
         _validate_schedule(suggested_hours)
+        suggested_season = schedule_season_for_utc(now)
     except (OSError, RuntimeError, ValueError) as error:
         issues.append(f"UTC sessions: {error}")
 
@@ -158,6 +168,7 @@ def validate_symbol(
         history_bars,
         max_observed_spread,
         suggested_hours,
+        suggested_season,
         tuple(issues),
     )
 
@@ -165,6 +176,7 @@ def validate_symbol(
 def write_hours_utc(
     settings_path: str | Path,
     schedules: dict[str, tuple[str, ...]],
+    season: ScheduleSeason,
 ) -> None:
     path = Path(settings_path)
     if not schedules:
@@ -199,16 +211,34 @@ def write_hours_utc(
         hours_indices = [
             index
             for index in range(start, end)
-            if content(lines[index]).lstrip().startswith("hours_utc")
+            if re.match(r"^\s*hours_utc\s*=", content(lines[index]))
         ]
         if len(hours_indices) != 1:
             raise ValueError(f"Expected exactly one hours_utc setting for {symbol}")
+        season_indices = [
+            index
+            for index in range(start, end)
+            if re.match(r"^\s*hours_utc_season\s*=", content(lines[index]))
+        ]
+        if len(season_indices) > 1:
+            raise ValueError(
+                f"Expected at most one hours_utc_season setting for {symbol}"
+            )
         old_line = lines[hours_indices[0]]
         old_content = content(old_line)
         indent = old_content[: len(old_content) - len(old_content.lstrip())]
         line_ending = old_line[len(old_content) :]
+        if not line_ending:
+            line_ending = "\r\n" if "\r\n" in "".join(lines) else "\n"
         value = ", ".join(json.dumps(hour) for hour in hours)
         lines[hours_indices[0]] = f"{indent}hours_utc = [{value}]{line_ending}"
+        season_line = (
+            f"{indent}hours_utc_season = {json.dumps(season)}{line_ending}"
+        )
+        if season_indices:
+            lines[season_indices[0]] = season_line
+        else:
+            lines.insert(hours_indices[0] + 1, season_line)
 
     updated = "".join(lines)
     temporary_path = path.with_suffix(path.suffix + ".tmp")
@@ -225,18 +255,18 @@ def _validate_schedule(hours: tuple[str, ...]) -> None:
         raise ValueError("broker returned no sessions")
     sessions = parse_sessions(hours)
     failures: list[str] = []
-    if not any(session.weekday == 4 for session in sessions):
+    if not any(
+        session.weekday == 4
+        or (
+            session.weekday + int(session.full_day or session.closes_utc < session.opens_utc)
+        )
+        % 7
+        == 4
+        for session in sessions
+    ):
         failures.append("schedule has no Friday session")
-    by_day: dict[int, list[tuple[int, int]]] = {}
-    for session in sessions:
-        start = session.opens_utc.hour * 60 + session.opens_utc.minute
-        end = session.closes_utc.hour * 60 + session.closes_utc.minute
-        by_day.setdefault(session.weekday, []).append((start, end))
-    for day_windows in by_day.values():
-        day_windows.sort()
-        if any(current[0] < previous[1] for previous, current in pairwise(day_windows)):
-            failures.append("schedule contains overlapping windows")
-            break
+    if session_windows_overlap(sessions):
+        failures.append("schedule contains overlapping windows")
     if failures:
         raise ValueError("; ".join(failures))
 
@@ -273,6 +303,7 @@ def _report(
     history_bars: int,
     max_observed_spread_points: float | None,
     suggested_hours_utc: tuple[str, ...],
+    suggested_hours_utc_season: ScheduleSeason | None,
     issues: tuple[str, ...],
 ) -> SymbolValidationReport:
     return SymbolValidationReport(
@@ -282,5 +313,6 @@ def _report(
         history_bars=history_bars,
         max_observed_spread_points=max_observed_spread_points,
         suggested_hours_utc=suggested_hours_utc,
+        suggested_hours_utc_season=suggested_hours_utc_season,
         issues=issues,
     )

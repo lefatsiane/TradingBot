@@ -197,7 +197,12 @@ def run_bot(
             from bot.adapters.mt5_broker import MT5Broker
 
             live_broker = MT5Broker(
-                deviation_points=settings.execution.deviation_points
+                deviation_points=settings.execution.deviation_points,
+                on_server_clock_mismatch=lambda message: _block_new_entries_for_clock_mismatch(
+                    store,
+                    clock,
+                    message,
+                ),
             )
             live_broker.connect(
                 login=secrets.mt5_login,
@@ -366,6 +371,21 @@ def _log_minimum_lot_startup_report(
                 symbol,
                 "; ".join(report.issues),
             )
+
+
+def _block_new_entries_for_clock_mismatch(
+    store: StateStore,
+    clock: Clock,
+    message: str,
+) -> None:
+    store.set_flag("stop_new", True)
+    store.enqueue_alert(
+        AlertPayload(
+            clock.now_utc().astimezone(UTC).isoformat(),
+            "CRITICAL",
+            f"Broker clock verification failed: {message}",
+        )
+    )
 
 
 class CrashLoopGuard:

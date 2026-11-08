@@ -26,11 +26,13 @@ from bot.app.config import (
 from bot.app.data import DataQualityError, Timeframe
 from bot.app.engine import Engine
 from bot.app.executor import Executor
+from bot.app.news import NewsEvent
+from bot.app.random_control import RandomEntryKey
 from bot.core.clock import SimClock
 from bot.core.strategy_a import StrategyAParams
 from bot.core.strategy_b import StrategyBParams
 from bot.core.timeutil import expected_new_york_offset
-from bot.core.types import Candle, Decision, SymbolSpec
+from bot.core.types import Candle, Decision, Side, SymbolSpec
 
 StrategyMode = Literal["a", "b", "both"]
 HistoryMap = Mapping[tuple[str, Timeframe], tuple[Candle, ...]]
@@ -41,6 +43,11 @@ DEFAULT_STARTING_EQUITY = 3_000.0
 class ReplayRunResult:
     strategy_mode: StrategyMode
     strategy_parameters: dict[str, dict[str, int | float]]
+    random_entry_targets: dict[str, int] | None
+    news_events: tuple[NewsEvent, ...]
+    news_calendar_valid: bool | None
+    news_block_before_min: int
+    news_block_after_min: int
     starting_equity: float
     ending_equity: float
     cost_multiplier: float
@@ -74,6 +81,8 @@ def run_replay(
     cost_multiplier: float = 1.0,
     strategy_a_params: StrategyAParams | None = None,
     strategy_b_params: StrategyBParams | None = None,
+    random_entry_schedule: Mapping[RandomEntryKey, Side] | None = None,
+    random_entry_targets: Mapping[str, int] | None = None,
 ) -> ReplayRunResult:
     """Replay cached candles through the production Engine, Executor and SimBroker."""
     now = _require_utc(now_utc, "now_utc")
@@ -83,6 +92,14 @@ def run_replay(
         raise ValueError("Strategy A parameter overrides require strategy_mode='a'")
     if strategy_b_params is not None and strategy_mode != "b":
         raise ValueError("Strategy B parameter overrides require strategy_mode='b'")
+    if (random_entry_schedule is None) != (random_entry_targets is None):
+        raise ValueError("Random-entry schedule and targets must be provided together")
+    if random_entry_schedule is not None and strategy_mode == "both":
+        raise ValueError("Random-entry control requires strategy_mode='a' or 'b'")
+    if random_entry_targets is not None and any(
+        target < 0 for target in random_entry_targets.values()
+    ):
+        raise ValueError("Random-entry targets cannot be negative")
     if settings.account.mode != "demo" or settings.account.allow_live:
         raise ValueError("Replay requires demo-only settings with live trading disabled")
     if starting_equity <= 0 or not isfinite(starting_equity):
@@ -193,12 +210,16 @@ def run_replay(
         strategy_mode=strategy_mode,
         strategy_a_params=strategy_a_params,
         strategy_b_params=strategy_b_params,
+        random_entry_schedule=random_entry_schedule,
+        random_entry_targets=random_entry_targets,
     )
 
     decisions: list[Decision] = []
     equity_curve = [EquityPoint(first_time, simulated_account.equity)]
     try:
         engine.start()
+        replay_news_events = engine.news_events
+        replay_news_calendar_valid = engine.news_calendar_valid
         events = sorted(
             {
                 candle.time
@@ -262,6 +283,15 @@ def run_replay(
                 "A": asdict(settings.strategy_a.to_params()),
                 "B": asdict(settings.strategy_b.to_params()),
             },
+            random_entry_targets=(
+                dict(random_entry_targets)
+                if random_entry_targets is not None
+                else None
+            ),
+            news_events=replay_news_events,
+            news_calendar_valid=replay_news_calendar_valid,
+            news_block_before_min=settings.news.block_before_min,
+            news_block_after_min=settings.news.block_after_min,
             starting_equity=starting_equity,
             ending_equity=final_account.equity,
             cost_multiplier=cost_multiplier,
@@ -357,6 +387,20 @@ def write_replay_report(
         "created_at_utc": created.isoformat(),
         "strategy": result.strategy_mode,
         "strategy_parameters": result.strategy_parameters,
+        "random_entry_control": result.random_entry_targets is not None,
+        "random_entry_targets": result.random_entry_targets,
+        "news_calendar_valid": result.news_calendar_valid,
+        "news_block_before_min": result.news_block_before_min,
+        "news_block_after_min": result.news_block_after_min,
+        "news_events": [
+            {
+                "time_utc": event.time_utc.isoformat(),
+                "currency": event.currency,
+                "impact": event.impact,
+                "title": event.title,
+            }
+            for event in result.news_events
+        ],
         "news_enabled": result.news_enabled,
         "final_run": result.final_run,
         "cost_multiplier": result.cost_multiplier,

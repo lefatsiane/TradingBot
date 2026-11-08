@@ -7,8 +7,6 @@ from math import isfinite
 from bot.core.types import OpenRisk, ReasonCode, Side, SymbolSpec
 
 CREDIT_REALIZED_PROFITS_TO_DAILY_HEADROOM = False
-# DECISION-PENDING: keep this conservative until the owner decides if profits may
-# restore risk headroom.
 
 
 @dataclass(frozen=True, slots=True)

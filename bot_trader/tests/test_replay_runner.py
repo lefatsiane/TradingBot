@@ -25,7 +25,7 @@ from bot.core.replay import ReplaySettings
 from bot.core.risk import RiskLimits
 from bot.core.strategy_a import StrategyAParams
 from bot.core.strategy_b import StrategyBParams
-from bot.core.types import Candle, SymbolSpec
+from bot.core.types import Candle, Side, SymbolSpec
 from tools import replay as replay_tool
 
 SPEC = SymbolSpec(
@@ -103,6 +103,7 @@ def _settings():
                 "thu 00:00-21:55",
                 "fri 00:00-21:55",
             ),
+            "hours_utc_season": "US winter",
         }
     )
     return settings.model_copy(update={"symbols": symbols})
@@ -408,3 +409,53 @@ def test_engine_replay_strategy_a_matches_legacy_fixture_at_95_percent(
     assert trade_rows
     assert all(row["strategy"] == "A" and row["timeframe"] == "H1" for row in trade_rows)
     assert any(row["grouping"] == "combined_A+B" for row in breakdown_rows)
+
+
+def test_random_entry_schedule_runs_through_simulated_engine_and_records_target(
+    tmp_path,
+) -> None:
+    settings = _settings()
+    start = datetime(2026, 1, 1, 0, tzinfo=UTC)
+    h1 = _parity_fixture(start, 650)
+    last = h1[-1]
+    h1 = (
+        *h1,
+        Candle(
+            last.time + timedelta(hours=1),
+            last.close,
+            last.close + 0.0003,
+            last.close - 0.0003,
+            last.close,
+            spread=0.0001,
+        ),
+    )
+    h4 = tuple(
+        Candle(
+            start + timedelta(hours=index * 4),
+            1.1,
+            1.1002,
+            1.0998,
+            1.1001,
+            spread=0.0001,
+        )
+        for index in range(165)
+    )
+    result = run_replay(
+        {("EURUSD", "H1"): h1, ("EURUSD", "H4"): h4},
+        {"EURUSD": SPEC},
+        settings,
+        now_utc=h1[-1].time + timedelta(hours=1),
+        final=True,
+        no_news=True,
+        strategy_mode="a",
+        random_entry_schedule={
+            ("EURUSD", "H1", h1[-2].time): Side.LONG,
+        },
+        random_entry_targets={"EURUSD": 1},
+        report_root=tmp_path,
+    )
+
+    assert len(result.trades) == 1
+    assert result.trades[0].strategy == "A"
+    assert result.random_entry_targets == {"EURUSD": 1}
+    assert sum(deal.is_entry is True for deal in result.deals) == 1

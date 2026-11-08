@@ -12,7 +12,7 @@ from bot.adapters.sim_broker import Fault, FaultPlan, SimBroker
 from bot.adapters.store import StateStore
 from bot.app import engine as engine_module
 from bot.app.config import load_settings
-from bot.app.engine import Engine, EntryContext, evaluate_candle
+from bot.app.engine import Engine, EntryContext, _propose, evaluate_candle
 from bot.app.executor import ExecutionResult, Executor
 from bot.app.news import NewsEvent
 from bot.core.clock import SimClock
@@ -45,6 +45,7 @@ def _context(**updates) -> EntryContext:
     symbol_settings = settings.symbols["EURUSD"].model_copy(
         update={
             "hours_utc": ("mon 00:00-21:55", "fri 00:00-21:55"),
+            "hours_utc_season": "US summer",
             "max_spread_points": 100.0,
         }
     )
@@ -70,6 +71,20 @@ def _context(**updates) -> EntryContext:
     }
     values.update(updates)
     return EntryContext(**values)
+
+
+def test_random_control_without_selected_bar_never_falls_back_to_strategy() -> None:
+    context = _context(
+        strategy_mode="a",
+        random_entry_control=True,
+        random_entry_side=None,
+    )
+
+    strategy, result = _propose(context)
+
+    assert strategy == "A"
+    assert result.proposal is None
+    assert result.reason is ReasonCode.NO_TRIGGER
 
 
 @pytest.mark.parametrize(
@@ -776,6 +791,7 @@ def test_entry_lane_carries_accepted_trade_risk_to_later_contexts(
         symbol: context.settings.symbols[symbol].model_copy(
             update={
                 "hours_utc": ("mon 00:00-21:55", "fri 00:00-21:55"),
+                "hours_utc_season": "US summer",
                 "max_spread_points": 100.0,
             }
         )
@@ -1173,7 +1189,9 @@ def test_daily_loss_limit_keeps_protective_stop_and_position_open(tmp_path) -> N
     assert not store.get_flag("halted_monthly")
 
 
-def test_management_lane_flattens_before_configured_friday_close(tmp_path) -> None:
+def test_management_lane_flattens_before_configured_friday_close(
+    tmp_path, monkeypatch
+) -> None:
     now = datetime(2026, 10, 30, 21, 40, tzinfo=UTC)
     context = _context(now_utc=now)
     symbol_settings = context.settings.symbols["EURUSD"].model_copy(
@@ -1234,6 +1252,27 @@ def test_management_lane_flattens_before_configured_friday_close(tmp_path) -> No
         settings_version="settings",
     )
 
+    close_position = executor.close_position
+    close_attempts = 0
+
+    def fail_first_close(ticket, reason):
+        nonlocal close_attempts
+        close_attempts += 1
+        if close_attempts == 1:
+            return False
+        return close_position(ticket, reason)
+
+    monkeypatch.setattr(executor, "close_position", fail_first_close)
+    engine.run_management_lane()
+
+    assert store.get_flag("close_all_pending")
+    assert len(broker.positions(712345)) == 1
+    assert any(alert.severity == "CRITICAL" for alert in store.pending_alerts())
+    assert evaluate_candle(
+        replace(context, stop_new=store.get_flag("close_all_pending"))
+    ).reason is ReasonCode.STOP_NEW
+
+    clock.advance(timedelta(seconds=3))
     report = engine.run_management_lane()
 
     assert f"weekend-close:{opened.trade.ticket}" in report.actions
@@ -1914,7 +1953,7 @@ def test_engine_simulated_week_covers_gates_limits_flatten_and_restart(
     assert not restarted_store.get_flag("halted_daily")
     assert not restarted_store.get_flag("halted_monthly")
 
-    friday_time = datetime(2026, 11, 6, 21, 40, tzinfo=UTC)
+    friday_time = datetime(2026, 11, 6, 22, 40, tzinfo=UTC)
     set_market(
         friday_time,
         friday_time - timedelta(hours=1),

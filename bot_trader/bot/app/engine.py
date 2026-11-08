@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from math import isfinite
@@ -9,7 +9,7 @@ from typing import BinaryIO, Literal
 from bot.adapters.broker import OrderRequest, Tick
 from bot.adapters.gateway import BrokerGateway
 from bot.adapters.store import AlertPayload, DecisionRecord, StateStore
-from bot.app.config import Settings, parse_sessions, startup_guard
+from bot.app.config import Settings, sessions_for_utc, startup_guard
 from bot.app.data import DataQualityError, last_closed_candles
 from bot.app.executor import Executor
 from bot.app.news import (
@@ -17,6 +17,10 @@ from bot.app.news import (
     calendar_has_minimum_coverage,
     is_news_blocked,
     load_news_calendar,
+)
+from bot.app.random_control import (
+    RandomEntryKey,
+    propose_random_entry,
 )
 from bot.core.clock import Clock
 from bot.core.gates import (
@@ -56,6 +60,7 @@ from bot.core.types import (
 
 MAX_ENTRY_TICK_AGE = timedelta(minutes=10)
 CLOSE_ALL_RETRY_INTERVAL = timedelta(seconds=3)
+CLOSE_ALL_ALERT_INTERVAL = timedelta(minutes=1)
 
 
 def _tick_is_fresh(tick: Tick, at_utc: datetime) -> bool:
@@ -100,6 +105,8 @@ class EntryContext:
     strategy_mode: Literal["a", "b", "both"] = "both"
     strategy_a_params: StrategyAParams | None = None
     strategy_b_params: StrategyBParams | None = None
+    random_entry_control: bool = False
+    random_entry_side: Side | None = None
     stop_new: bool = False
     halted_daily: bool = False
     halted_monthly: bool = False
@@ -124,7 +131,12 @@ def evaluate_candle(context: EntryContext) -> Decision:
     weekend_close = context.weekend_close_utc
     if weekend_close is None:
         return _decision(context, at_utc, ReasonCode.DATA_ERROR)
-    schedule = parse_sessions(context.settings.symbols[context.symbol].hours_utc)
+    symbol_settings = context.settings.symbols[context.symbol]
+    schedule = sessions_for_utc(
+        symbol_settings.hours_utc,
+        symbol_settings.hours_utc_season,
+        at_utc,
+    )
     gate = _gate(
         context,
         at_utc,
@@ -313,6 +325,33 @@ def _gate(
 def _propose(context: EntryContext) -> tuple[str, StrategyResult]:
     params_a = context.strategy_a_params or context.settings.strategy_a.to_params()
     params_b = context.strategy_b_params or context.settings.strategy_b.to_params()
+    if context.random_entry_control:
+        if context.random_entry_side is None:
+            return (
+                ("A" if context.strategy_mode == "a" else "B"),
+                StrategyResult(None, ReasonCode.NO_TRIGGER),
+            )
+        if context.strategy_mode == "a":
+            return (
+                "A",
+                propose_random_entry(
+                    context.candles,
+                    "a",
+                    context.random_entry_side,
+                    params_a,
+                ),
+            )
+        if context.strategy_mode == "b":
+            return (
+                "B",
+                propose_random_entry(
+                    context.candles,
+                    "b",
+                    context.random_entry_side,
+                    params_b,
+                ),
+            )
+        raise ValueError("Random-entry control requires a single strategy mode")
     if context.strategy_mode == "a":
         if context.timeframe in context.settings.strategy_a.timeframes:
             return "A", propose_a(context.candles, params_a)
@@ -466,9 +505,19 @@ class Engine:
         strategy_mode: Literal["a", "b", "both"] = "both",
         strategy_a_params: StrategyAParams | None = None,
         strategy_b_params: StrategyBParams | None = None,
+        random_entry_schedule: Mapping[RandomEntryKey, Side] | None = None,
+        random_entry_targets: Mapping[str, int] | None = None,
     ) -> None:
         if strategy_mode not in ("a", "b", "both"):
             raise ValueError("strategy_mode must be 'a', 'b', or 'both'")
+        if (random_entry_schedule is None) != (random_entry_targets is None):
+            raise ValueError("Random-entry schedule and targets must be provided together")
+        if random_entry_schedule is not None and strategy_mode == "both":
+            raise ValueError("Random-entry control requires a single strategy mode")
+        if random_entry_targets is not None and any(
+            target < 0 for target in random_entry_targets.values()
+        ):
+            raise ValueError("Random-entry targets cannot be negative")
         self._settings = settings
         self._gateway = gateway
         self._store = store
@@ -481,9 +530,20 @@ class Engine:
         self._strategy_mode = strategy_mode
         self._strategy_a_params = strategy_a_params
         self._strategy_b_params = strategy_b_params
+        self._random_entry_schedule = random_entry_schedule or {}
+        self._random_entry_remaining = dict(random_entry_targets or {})
+        self._random_entry_control = random_entry_schedule is not None
         self._news_events: tuple[NewsEvent, ...] = ()
         self._news_calendar_valid: bool | None = None
         self._instance_lock_file: BinaryIO | None = None
+
+    @property
+    def news_events(self) -> tuple[NewsEvent, ...]:
+        return self._news_events
+
+    @property
+    def news_calendar_valid(self) -> bool | None:
+        return self._news_calendar_valid
 
     def run_entry_lane(self) -> tuple[Decision, ...]:
         decisions: list[Decision] = []
@@ -565,6 +625,12 @@ class Engine:
                         strategy_mode=self._strategy_mode,
                         strategy_a_params=self._strategy_a_params,
                         strategy_b_params=self._strategy_b_params,
+                        random_entry_control=self._random_entry_control,
+                        random_entry_side=(
+                            self._random_entry_schedule.get((symbol, timeframe, newest.time))
+                            if self._random_entry_remaining.get(symbol, 0) > 0
+                            else None
+                        ),
                         bars_since_stop=self._bars_since_stop(
                             symbol, timeframe, window
                         ),
@@ -658,6 +724,8 @@ class Engine:
                                     indicators=decision.indicators,
                                 )
                             else:
+                                if context.random_entry_side is not None:
+                                    self._random_entry_remaining[symbol] -= 1
                                 accepted_risks.append(
                                     OpenRisk(
                                         symbol,
@@ -708,7 +776,11 @@ class Engine:
             rollover_at = next_trading_day_boundary_utc(now_utc, server_offset)
         weekend_close = next_weekend_close_utc(
             now_utc,
-            parse_sessions(self._settings.symbols[context.symbol].hours_utc),
+            sessions_for_utc(
+                self._settings.symbols[context.symbol].hours_utc,
+                self._settings.symbols[context.symbol].hours_utc_season,
+                now_utc,
+            ),
         )
         return replace(
             context,
@@ -1124,13 +1196,33 @@ class Engine:
                 )
                 if not close_all_positions:
                     self._store.set_flag("close_all_pending", False)
+                    self._clear_close_all_tracking()
                 elif self._close_all_retry_due(now):
                     self._store.set_meta("close_all_last_attempt_utc", now.isoformat())
+                    exit_reason = (
+                        ExitReason.WEEKEND_FLATTEN
+                        if self._store.get_meta("close_all_exit_reason")
+                        == ExitReason.WEEKEND_FLATTEN.value
+                        else ExitReason.CLOSE_ALL
+                    )
+                    action_prefix = (
+                        "weekend-close"
+                        if exit_reason is ExitReason.WEEKEND_FLATTEN
+                        else "close-all"
+                    )
                     for position in close_all_positions:
                         if self._executor.close_position(
-                            position.ticket, ExitReason.CLOSE_ALL
+                            position.ticket, exit_reason
                         ):
-                            actions.append(f"close-all:{position.ticket}")
+                            actions.append(f"{action_prefix}:{position.ticket}")
+                    remaining_positions = self._gateway.positions(
+                        self._settings.account.magic_number
+                    )
+                    if remaining_positions:
+                        self._alert_close_all_incomplete(now, len(remaining_positions))
+                    else:
+                        self._store.set_flag("close_all_pending", False)
+                        self._clear_close_all_tracking()
 
             positions = self._gateway.positions(self._settings.account.magic_number)
             trades = {trade.ticket: trade for trade in self._store.open_trades()}
@@ -1138,16 +1230,39 @@ class Engine:
                 if not symbol_settings.enabled:
                     continue
                 close_at = next_weekend_close_utc(
-                    now, parse_sessions(symbol_settings.hours_utc)
+                    now,
+                    sessions_for_utc(
+                        symbol_settings.hours_utc,
+                        symbol_settings.hours_utc_season,
+                        now,
+                    ),
                 )
                 if close_at - now <= timedelta(
                     minutes=self._settings.timing.flatten_before_weekend_close_min
                 ):
-                    for position in positions:
-                        if position.symbol == symbol and self._executor.close_position(
-                            position.ticket, ExitReason.WEEKEND_FLATTEN
-                        ):
-                            actions.append(f"weekend-close:{position.ticket}")
+                    positions = self._gateway.positions(
+                        self._settings.account.magic_number
+                    )
+                    if positions and not self._store.get_flag("close_all_pending"):
+                        self._store.set_flag("close_all_pending", True)
+                        self._store.set_meta(
+                            "close_all_exit_reason", ExitReason.WEEKEND_FLATTEN.value
+                        )
+                        for position in positions:
+                            if self._executor.close_position(
+                                position.ticket, ExitReason.WEEKEND_FLATTEN
+                            ):
+                                actions.append(f"weekend-close:{position.ticket}")
+                        remaining_positions = self._gateway.positions(
+                            self._settings.account.magic_number
+                        )
+                        if remaining_positions:
+                            self._alert_close_all_incomplete(
+                                now, len(remaining_positions)
+                            )
+                        else:
+                            self._store.set_flag("close_all_pending", False)
+                            self._clear_close_all_tracking()
 
             for trade in trades.values():
                 if trade.strategy != "B" or trade.timeframe != "H1":
@@ -1200,10 +1315,26 @@ class Engine:
 
     def _close_all_retry_due(self, now: datetime) -> bool:
         last_attempt = self._store.get_meta("close_all_last_attempt_utc")
-        if last_attempt is None:
+        if not last_attempt:
             return True
         previous = datetime.fromisoformat(last_attempt)
         return now - previous >= CLOSE_ALL_RETRY_INTERVAL
+
+    def _alert_close_all_incomplete(self, now: datetime, position_count: int) -> None:
+        last_alert = self._store.get_meta("close_all_last_alert_utc")
+        if last_alert:
+            previous = datetime.fromisoformat(last_alert)
+            if now - previous < CLOSE_ALL_ALERT_INTERVAL:
+                return
+        self._critical_alert(
+            f"Close-all remains incomplete; {position_count} bot position(s) remain open"
+        )
+        self._store.set_meta("close_all_last_alert_utc", now.isoformat())
+
+    def _clear_close_all_tracking(self) -> None:
+        self._store.set_meta("close_all_last_attempt_utc", "")
+        self._store.set_meta("close_all_last_alert_utc", "")
+        self._store.set_meta("close_all_exit_reason", "")
 
     def _critical_alert(self, message: str) -> None:
         self._store.enqueue_alert(

@@ -14,7 +14,9 @@ from bot.app.config import (
     load_runtime_secrets,
     load_settings,
     parse_sessions,
+    schedule_season_for_utc,
     schedule_validation_failures,
+    sessions_for_utc,
     startup_guard,
 )
 from bot.app.logging_setup import configure_logging
@@ -62,22 +64,108 @@ def test_parse_sessions_accepts_valid_catalog_windows() -> None:
     )
 
 
+def test_parse_sessions_treats_2400_as_exclusive_midnight() -> None:
+    sessions = parse_sessions(
+        ("sun 22:01-24:00", "mon 00:00-21:59", "fri 00:00-21:55")
+    )
+
+    assert sessions == (
+        SessionWindow(6, time(22, 1), time(0)),
+        SessionWindow(0, time(0), time(21, 59)),
+        SessionWindow(4, time(0), time(21, 55)),
+    )
+
+
+def test_parse_sessions_accepts_full_day_with_2400_end() -> None:
+    assert parse_sessions(("mon 00:00-24:00",)) == (
+        SessionWindow(0, time(0), time(0), full_day=True),
+    )
+    assert sessions_for_utc(
+        ("mon 00:00-24:00",),
+        "US winter",
+        datetime(2026, 7, 7, 12, tzinfo=UTC),
+    ) == (SessionWindow(6, time(23), time(23), full_day=True),)
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    (
+        ("mon 24:00-01:00",),
+        ("mon 00:00-24:01",),
+        ("mon 00:00-25:00",),
+    ),
+)
+def test_parse_sessions_rejects_invalid_24_hour_endpoints(
+    schedule: tuple[str, ...],
+) -> None:
+    with pytest.raises(ValueError, match="Invalid hours_utc session"):
+        parse_sessions(schedule)
+
+
+def test_schedule_season_shifts_windows_with_new_york_dst_and_wraps_weekday() -> None:
+    winter_sessions = ("mon 00:00-21:55", "fri 00:00-21:55")
+
+    summer = sessions_for_utc(
+        winter_sessions,
+        "US winter",
+        datetime(2026, 7, 7, 12, tzinfo=UTC),
+    )
+    winter = sessions_for_utc(
+        winter_sessions,
+        "US winter",
+        datetime(2026, 11, 7, 12, tzinfo=UTC),
+    )
+
+    assert schedule_season_for_utc(datetime(2026, 7, 7, 12, tzinfo=UTC)) == "US summer"
+    assert schedule_season_for_utc(datetime(2026, 11, 7, 12, tzinfo=UTC)) == "US winter"
+    assert summer == (
+        SessionWindow(3, time(23), time(20, 55)),
+        SessionWindow(6, time(23), time(20, 55)),
+    )
+    assert winter == parse_sessions(winter_sessions)
+    assert next_weekend_close_utc(
+        datetime(2026, 7, 9, 22, tzinfo=UTC),
+        summer,
+    ) == datetime(2026, 7, 10, 20, 55, tzinfo=UTC)
+    assert next_weekend_close_utc(
+        datetime(2026, 7, 10, 20, tzinfo=UTC),
+        summer,
+    ) == datetime(2026, 7, 10, 20, 55, tzinfo=UTC)
+
+
 def test_enabled_symbols_require_non_overlapping_friday_schedules() -> None:
     source = Path(__file__).parents[1] / "settings.toml"
     settings, _ = load_settings(source)
-    failures = schedule_validation_failures(settings)
+    summer_now = datetime(2026, 7, 7, 12, tzinfo=UTC)
+    failures = schedule_validation_failures(settings, now_utc=summer_now)
     assert len(failures) == 6
     assert all("hours_utc is empty" in failure for failure in failures)
     assert not any("XAUUSD" in failure for failure in failures)
 
     symbols = {
         symbol: symbol_settings.model_copy(
-            update={"hours_utc": ("mon 00:00-21:55", "fri 00:00-21:55")}
+            update={
+                "hours_utc": ("mon 00:00-21:55", "fri 00:00-21:55"),
+                "hours_utc_season": "US summer",
+            }
         )
         for symbol, symbol_settings in settings.symbols.items()
     }
     valid = settings.model_copy(update={"symbols": symbols})
-    assert schedule_validation_failures(valid) == ()
+    assert schedule_validation_failures(valid, now_utc=summer_now) == ()
+    winter_schedule = symbols["EURUSD"].model_copy(
+        update={"hours_utc_season": "US winter"}
+    )
+    stale_season = settings.model_copy(update={"symbols": {"EURUSD": winter_schedule}})
+    assert schedule_validation_failures(stale_season, now_utc=summer_now) == ()
+    assert sessions_for_utc(
+        winter_schedule.hours_utc,
+        winter_schedule.hours_utc_season,
+        summer_now,
+    ) == (
+        SessionWindow(3, time(23), time(20, 55)),
+        SessionWindow(6, time(23), time(20, 55)),
+    )
 
     eurusd = symbols["EURUSD"].model_copy(
         update={
@@ -91,6 +179,46 @@ def test_enabled_symbols_require_non_overlapping_friday_schedules() -> None:
     issues = schedule_validation_failures(invalid)
     assert any("no Friday session" in issue for issue in issues)
     assert any("overlapping" in issue for issue in issues)
+
+
+def test_schedule_validation_accepts_midnight_boundary_and_detects_overlap() -> None:
+    source = Path(__file__).parents[1] / "settings.toml"
+    settings, _ = load_settings(source)
+    schedule = (
+        "sun 22:01-24:00",
+        "mon 00:00-21:59",
+        "fri 00:00-21:55",
+    )
+    symbol = settings.symbols["EURUSD"].model_copy(
+        update={
+            "hours_utc": schedule,
+            "hours_utc_season": "US winter",
+        }
+    )
+    valid = settings.model_copy(update={"symbols": {"EURUSD": symbol}})
+    assert schedule_validation_failures(
+        valid,
+        now_utc=datetime(2026, 11, 7, 12, tzinfo=UTC),
+    ) == ()
+
+    overlapping = symbol.model_copy(
+        update={
+            "hours_utc": (
+                "sun 22:01-24:00",
+                "sun 23:00-23:30",
+                "mon 00:00-21:59",
+                "fri 00:00-21:55",
+            )
+        }
+    )
+    invalid = settings.model_copy(update={"symbols": {"EURUSD": overlapping}})
+    assert any(
+        "overlapping" in failure
+        for failure in schedule_validation_failures(
+            invalid,
+            now_utc=datetime(2026, 11, 7, 12, tzinfo=UTC),
+        )
+    )
 
 
 def test_next_weekend_close_utc_finds_the_next_friday_close() -> None:
