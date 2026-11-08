@@ -29,3 +29,7 @@
 - Complete the MT5 demo-terminal clock cross-check and remaining demo runtime/restart/control drills.
 - Run random-entry and sensitivity acceptance only after the schedules and real news data are
   available; no live orders or unreviewed schedule assumptions are permitted.
+
+## Later question
+
+- Consider a separate verified-through date for quiet periods.
