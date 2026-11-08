@@ -1,4 +1,4 @@
-"""Technical indicator helpers used throughout the trading bot."""
+﻿"""Technical indicator helpers used throughout the trading bot."""
 
 from __future__ import annotations
 
@@ -93,7 +93,7 @@ def bollinger(
     lower: list[float | None] = [None] * len(values)
 
     for index in range(period - 1, len(values)):
-        window = values[index - period + 1 : index + 1]
+        window = values[index - period + 1: index + 1]
         mean = sum(window) / period
         variance = sum((value - mean) ** 2 for value in window) / period
         width = deviations * math.sqrt(variance)
@@ -157,10 +157,12 @@ def adx(candles: Sequence[Candle], period: int = 14) -> list[float | None]:
         plus_di = 100.0 * plus / a
         minus_di = 100.0 * minus / a
         denominator = plus_di + minus_di
-        dx[index] = 0.0 if denominator == 0 else 100.0 * abs(plus_di - minus_di) / denominator
+        dx[index] = 0.0 if denominator == 0 else 100.0 * \
+            abs(plus_di - minus_di) / denominator
 
     first_dx = 2 * period - 2
-    initial = [value for value in dx[period - 1 : first_dx + 1] if value is not None]
+    initial = [value for value in dx[period -
+                                     1: first_dx + 1] if value is not None]
     if len(initial) < period:
         return result
 
