@@ -147,9 +147,10 @@ python -m bot.main --settings settings.toml validate
 ```
 
 This validates the TOML and enabled-symbol schedules. The checked-in template
-has empty `hours_utc` entries, so validation reports those missing schedules.
-The broker-derived suggestions must be reviewed on the owner's demo terminal
-before applying them. This command never connects to MT5 or places orders.
+has empty `hours_utc` entries, so the runtime schedule check remains blocked
+until those UTC schedules are reviewed and written. The
+`broker_session_hours_server_time` setting is the owner-provided schedule in
+broker server time; conversion uses the New York +7 seasonal offset.
 
 ## Run the demo runtime
 
@@ -168,7 +169,8 @@ service stop path leaves broker positions open with their protective stops.
 Read [docs/runbook.md](docs/runbook.md) before considering Task Scheduler; its
 installer and Windows settings have not been tested on the owner's laptop.
 
-Retrieve demo-terminal symbol/session data without changing settings:
+Review recent demo-terminal H1 candles and a fresh-tick server-offset check
+against the configured server-time schedule:
 
 ```powershell
 $env:MT5_LOGIN = "<demo login>"
@@ -176,17 +178,22 @@ $env:MT5_PASSWORD = "<demo password>"
 python tools/validate_symbols.py --settings settings.toml
 ```
 
-Only after reviewing passing suggestions, `--write` updates both `hours_utc` and
-`hours_utc_season`. The season records whether the broker-derived UTC windows were
-reviewed during US winter or US summer; runtime automatically shifts them by the
-New York-rule offset difference in the other season, including weekday rollover.
+The report does not read trading sessions from MT5 and never writes settings by
+default. It lists first/last H1 candle timestamps for each UTC weekday, and flags
+candles outside configured hours or expected H1 hours without candles. Continue
+after a symbol failure; all failures are summarized at the end. Only `--write`
+can update passing enabled symbols' `hours_utc` and `hours_utc_season`, and only
+after the report is shown and `APPLY` is entered at the confirmation prompt.
+The season records whether the UTC windows were reviewed during US winter or US
+summer; runtime shifts them by the New York-rule offset difference in the other
+season, including weekday rollover.
 
 ```powershell
 python tools/validate_symbols.py --settings settings.toml --write
 ```
 
-The tool has not been run against the owner terminal. Do not write schedules
-based on simulated or guessed market hours. Session end times are exclusive;
+The tool has not been run against the owner terminal. Review its H1 findings
+before applying schedules. Session end times are exclusive;
 `24:00` is accepted only as an end time and means midnight at the start of the
 next day. A session crossing midnight must otherwise be split across weekdays.
 

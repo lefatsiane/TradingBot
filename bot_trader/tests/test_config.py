@@ -9,7 +9,9 @@ import pytest
 
 from bot.adapters.broker import BrokerAccount
 from bot.app.config import (
+    BrokerSessionHoursServerTime,
     RiskSettings,
+    broker_session_hours_to_utc,
     build_simulator_costs,
     load_runtime_secrets,
     load_settings,
@@ -22,6 +24,31 @@ from bot.app.config import (
 from bot.app.logging_setup import configure_logging
 from bot.app.versioning import get_version
 from bot.core.gates import SessionWindow, next_weekend_close_utc
+
+WINTER_SERVER_SESSIONS_UTC = (
+    "sun 22:01-24:00",
+    "mon 00:00-21:59",
+    "mon 22:01-24:00",
+    "tue 00:00-21:59",
+    "tue 22:01-24:00",
+    "wed 00:00-21:59",
+    "wed 22:01-24:00",
+    "thu 00:00-21:59",
+    "thu 22:01-24:00",
+    "fri 00:00-21:57",
+)
+SUMMER_SERVER_SESSIONS_UTC = (
+    "sun 21:01-24:00",
+    "mon 00:00-20:59",
+    "mon 21:01-24:00",
+    "tue 00:00-20:59",
+    "tue 21:01-24:00",
+    "wed 00:00-20:59",
+    "wed 21:01-24:00",
+    "thu 00:00-20:59",
+    "thu 21:01-24:00",
+    "fri 00:00-20:57",
+)
 
 
 @pytest.mark.parametrize(
@@ -85,6 +112,67 @@ def test_parse_sessions_accepts_full_day_with_2400_end() -> None:
         "US winter",
         datetime(2026, 7, 7, 12, tzinfo=UTC),
     ) == (SessionWindow(6, time(23), time(23), full_day=True),)
+
+
+def test_broker_server_sessions_convert_to_both_utc_seasons() -> None:
+    server_hours = BrokerSessionHoursServerTime()
+
+    assert broker_session_hours_to_utc(
+        server_hours,
+        datetime(2026, 1, 15, 12, tzinfo=UTC),
+    ) == WINTER_SERVER_SESSIONS_UTC
+    assert broker_session_hours_to_utc(
+        server_hours,
+        datetime(2026, 7, 15, 12, tzinfo=UTC),
+    ) == SUMMER_SERVER_SESSIONS_UTC
+
+
+@pytest.mark.parametrize(
+    ("utc_time", "expected_season", "expected_sessions"),
+    (
+        (
+            datetime(2026, 3, 8, 6, 59, tzinfo=UTC),
+            "US winter",
+            WINTER_SERVER_SESSIONS_UTC,
+        ),
+        (
+            datetime(2026, 3, 8, 7, 0, tzinfo=UTC),
+            "US summer",
+            SUMMER_SERVER_SESSIONS_UTC,
+        ),
+        (
+            datetime(2026, 11, 1, 5, 59, tzinfo=UTC),
+            "US summer",
+            SUMMER_SERVER_SESSIONS_UTC,
+        ),
+        (
+            datetime(2026, 11, 1, 6, 0, tzinfo=UTC),
+            "US winter",
+            WINTER_SERVER_SESSIONS_UTC,
+        ),
+    ),
+)
+def test_broker_server_sessions_follow_both_us_clock_changes(
+    utc_time: datetime,
+    expected_season: str,
+    expected_sessions: tuple[str, ...],
+) -> None:
+    server_hours = BrokerSessionHoursServerTime()
+
+    assert schedule_season_for_utc(utc_time) == expected_season
+    assert broker_session_hours_to_utc(server_hours, utc_time) == expected_sessions
+
+
+def test_broker_server_session_conversion_splits_windows_at_utc_midnight() -> None:
+    sessions = broker_session_hours_to_utc(
+        BrokerSessionHoursServerTime(),
+        datetime(2026, 1, 15, 12, tzinfo=UTC),
+    )
+
+    assert "sun 22:01-24:00" in sessions
+    assert "mon 00:00-21:59" in sessions
+    assert "mon 22:01-24:00" in sessions
+    assert "fri 00:00-21:57" in sessions
 
 
 @pytest.mark.parametrize(

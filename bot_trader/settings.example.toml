@@ -43,6 +43,16 @@ unknown_outcome_wait_s = 15
 telegram_chat_id = 0
 command_max_age_s = 60
 
+# Broker-server wall time; UTC conversion applies the New York +7 seasonal offset.
+[broker_session_hours_server_time]
+sun = []
+mon = ["00:01-23:59"]
+tue = ["00:01-23:59"]
+wed = ["00:01-23:59"]
+thu = ["00:01-23:59"]
+fri = ["00:01-23:57"]
+sat = []
+
 [symbols.EURUSD]
 enabled = true
 commission_per_lot_side = 3.50

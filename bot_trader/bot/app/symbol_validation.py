@@ -4,13 +4,15 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
 from bot.adapters.broker import Broker
 from bot.app.config import (
+    BrokerSessionHoursServerTime,
     ScheduleSeason,
     SymbolSettings,
+    broker_session_hours_to_utc,
     parse_sessions,
     schedule_season_for_utc,
     session_windows_overlap,
@@ -18,6 +20,7 @@ from bot.app.config import (
 from bot.app.data import DataQualityError, validate_candles
 from bot.core.indicators import atr
 from bot.core.sizing import size_trade
+from bot.core.timeutil import broker_wall_time_to_utc
 from bot.core.types import Candle, Proposal, Side
 
 MIN_HISTORY_DAYS = 183
@@ -37,6 +40,14 @@ class SymbolValidationReport:
     suggested_hours_utc: tuple[str, ...]
     suggested_hours_utc_season: ScheduleSeason | None
     issues: tuple[str, ...]
+    weekday_candle_times: tuple[WeekdayCandleTimes, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class WeekdayCandleTimes:
+    weekday: str
+    first_utc: datetime | None
+    last_utc: datetime | None
 
 
 def validate_symbol(
@@ -49,6 +60,7 @@ def validate_symbol(
     cost_gate_pct_of_risk: float,
     max_stop_atr: float,
     now_utc: datetime,
+    server_session_hours: BrokerSessionHoursServerTime,
 ) -> SymbolValidationReport:
     now = _require_utc(now_utc)
     if equity <= 0 or risk_per_trade_pct <= 0 or max_stop_atr <= 0:
@@ -59,7 +71,13 @@ def validate_symbol(
         spec = broker.symbol_info(symbol)
     except (OSError, RuntimeError, ValueError) as error:
         return _report(
-            symbol, settings.enabled, 0, None, (), None, (f"symbol spec: {error}",)
+            symbol,
+            settings.enabled,
+            0,
+            None,
+            (),
+            None,
+            (f"symbol spec: {error}",),
         )
 
     try:
@@ -127,12 +145,33 @@ def validate_symbol(
 
     suggested_hours: tuple[str, ...] = ()
     suggested_season: ScheduleSeason | None = None
-    try:
-        suggested_hours = broker.symbol_sessions_utc(symbol)
-        _validate_schedule(suggested_hours)
-        suggested_season = schedule_season_for_utc(now)
-    except (OSError, RuntimeError, ValueError) as error:
-        issues.append(f"UTC sessions: {error}")
+    weekday_candle_times = _weekday_candle_summaries(recent)
+    if settings.enabled:
+        try:
+            suggested_season = schedule_season_for_utc(now)
+            suggested_hours = broker_session_hours_to_utc(
+                server_session_hours,
+                now,
+            )
+            _validate_schedule(suggested_hours)
+            outside, missing = _check_session_candles(
+                recent,
+                server_session_hours,
+                cutoff=cutoff,
+                end_utc=now,
+            )
+            if outside:
+                issues.append(
+                    f"{len(outside)} H1 candle(s) outside broker session hours; "
+                    f"first: {_format_candle_times(outside)}"
+                )
+            if missing:
+                issues.append(
+                    f"{len(missing)} expected H1 session hour(s) have no candle; "
+                    f"first: {_format_candle_times(missing)}"
+                )
+        except (OSError, RuntimeError, ValueError) as error:
+            issues.append(f"server session validation failed: {error}")
 
     if recent and tick_valid and tick is not None:
         average_true_range = atr(recent, ATR_PERIOD)[-1]
@@ -170,7 +209,107 @@ def validate_symbol(
         suggested_hours,
         suggested_season,
         tuple(issues),
+        weekday_candle_times,
     )
+
+
+def _weekday_candle_summaries(
+    candles: tuple[Candle, ...],
+) -> tuple[WeekdayCandleTimes, ...]:
+    summaries: list[WeekdayCandleTimes] = []
+    for weekday, name in enumerate(("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")):
+        seen = [candle.time for candle in candles if candle.time.weekday() == weekday]
+        summaries.append(
+            WeekdayCandleTimes(
+                weekday=name,
+                first_utc=seen[0] if seen else None,
+                last_utc=seen[-1] if seen else None,
+            )
+        )
+    return tuple(summaries)
+
+
+def _check_session_candles(
+    candles: tuple[Candle, ...],
+    server_hours: BrokerSessionHoursServerTime,
+    *,
+    cutoff: datetime,
+    end_utc: datetime,
+) -> tuple[tuple[datetime, ...], tuple[datetime, ...]]:
+    if not candles:
+        return (), ()
+    intervals = _server_session_intervals(
+        server_hours,
+        candles[0].time.date() - timedelta(days=1),
+        candles[-1].time.date() + timedelta(days=1),
+    )
+    candle_times = {candle.time for candle in candles}
+    outside: list[datetime] = []
+    interval_index = 0
+    for candle in candles:
+        while interval_index < len(intervals) and intervals[interval_index][1] <= candle.time:
+            interval_index += 1
+        if (
+            interval_index == len(intervals)
+            or not intervals[interval_index][0] <= candle.time < intervals[interval_index][1]
+        ):
+            outside.append(candle.time)
+    missing: list[datetime] = []
+    for start, end in intervals:
+        expected = start.replace(minute=0, second=0, microsecond=0)
+        if expected < start:
+            expected += _H1
+        while expected < end:
+            if (
+                cutoff <= expected
+                and expected + _H1 <= end_utc
+                and expected not in candle_times
+            ):
+                missing.append(expected)
+            expected += _H1
+    return tuple(outside), tuple(missing)
+
+
+def _server_session_intervals(
+    server_hours: BrokerSessionHoursServerTime,
+    first_server_date: date,
+    last_server_date: date,
+) -> tuple[tuple[datetime, datetime], ...]:
+    intervals: list[tuple[datetime, datetime]] = []
+    session_values = server_hours.model_dump()
+    current_date = first_server_date
+    while current_date <= last_server_date:
+        day_name = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")[
+            current_date.weekday()
+        ]
+        for window in session_values[day_name]:
+            start_text, end_text = window.split("-", maxsplit=1)
+            start_wall = datetime.combine(current_date, time.fromisoformat(start_text))
+            end_date = current_date + timedelta(days=end_text == "24:00")
+            end_time = time.min if end_text == "24:00" else time.fromisoformat(end_text)
+            end_wall = datetime.combine(end_date, end_time)
+            start_utc = _server_wall_datetime_to_utc(start_wall)
+            end_utc = _server_wall_datetime_to_utc(end_wall)
+            if end_utc <= start_utc:
+                raise ValueError(f"Invalid converted server session on {current_date}")
+            intervals.append((start_utc, end_utc))
+        current_date += timedelta(days=1)
+    return tuple(sorted(intervals))
+
+
+def _server_wall_datetime_to_utc(server_wall: datetime) -> datetime:
+    server_epoch = server_wall.replace(tzinfo=UTC).timestamp()
+    return broker_wall_time_to_utc(server_epoch)
+
+
+def _format_candle_times(candles: tuple[datetime, ...]) -> str:
+    examples = ", ".join(
+        candle_time.strftime("%Y-%m-%d %H:%M UTC")
+        for candle_time in candles[:5]
+    )
+    remaining = len(candles) - min(len(candles), 5)
+    suffix = f", plus {remaining} more" if remaining else ""
+    return examples + suffix
 
 
 def write_hours_utc(
@@ -305,6 +444,7 @@ def _report(
     suggested_hours_utc: tuple[str, ...],
     suggested_hours_utc_season: ScheduleSeason | None,
     issues: tuple[str, ...],
+    weekday_candle_times: tuple[WeekdayCandleTimes, ...] = (),
 ) -> SymbolValidationReport:
     return SymbolValidationReport(
         symbol=symbol,
@@ -315,4 +455,5 @@ def _report(
         suggested_hours_utc=suggested_hours_utc,
         suggested_hours_utc_season=suggested_hours_utc_season,
         issues=issues,
+        weekday_candle_times=weekday_candle_times,
     )

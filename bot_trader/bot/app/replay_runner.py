@@ -175,9 +175,6 @@ def run_replay(
         tick_data=initial_ticks,
         clock=clock,
         costs=_simulator_costs(settings, enabled_symbols, cost_multiplier),
-        session_hours={
-            symbol: settings.symbols[symbol].hours_utc for symbol in enabled_symbols
-        },
         server_offset_hours=expected_new_york_offset(first_time),
     )
     gateway = BrokerGateway(broker, max_retries=0)

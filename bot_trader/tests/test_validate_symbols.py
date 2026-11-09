@@ -6,25 +6,41 @@ from pathlib import Path
 
 import pytest
 
-from bot.adapters.broker import BrokerAccount, Tick
+from bot.adapters.broker import BrokerAccount, BrokerTerminalInfo, Tick
 from bot.adapters.sim_broker import SimBroker
-from bot.app.config import SymbolSettings
-from bot.app.symbol_validation import validate_symbol, write_hours_utc
+from bot.app.config import (
+    BrokerSessionHoursServerTime,
+    RuntimeSecrets,
+    SymbolSettings,
+    load_settings,
+)
+from bot.app.symbol_validation import (
+    SymbolValidationReport,
+    _check_session_candles,
+    validate_symbol,
+    write_hours_utc,
+)
 from bot.core.clock import SimClock
 from bot.core.types import Candle, SymbolSpec
+from tools import validate_symbols as validate_symbols_tool
 
 NOW = datetime(2026, 7, 7, 12, tzinfo=UTC)
 SYMBOL = "EURUSD"
 SESSIONS = (
-    "mon 00:00-21:55",
-    "tue 00:00-21:55",
-    "wed 00:00-21:55",
-    "thu 00:00-21:55",
-    "fri 00:00-21:55",
+    "sun 21:01-24:00",
+    "mon 00:00-20:59",
+    "mon 21:01-24:00",
+    "tue 00:00-20:59",
+    "tue 21:01-24:00",
+    "wed 00:00-20:59",
+    "wed 21:01-24:00",
+    "thu 00:00-20:59",
+    "thu 21:01-24:00",
+    "fri 00:00-20:57",
 )
 
 
-def _broker(*, minimum_lot: float = 0.01, sessions: tuple[str, ...] = SESSIONS) -> SimBroker:
+def _broker(*, minimum_lot: float = 0.01) -> SimBroker:
     start = NOW - timedelta(days=183)
     bars = tuple(
         Candle(
@@ -65,7 +81,6 @@ def _broker(*, minimum_lot: float = 0.01, sessions: tuple[str, ...] = SESSIONS) 
         tick_data={SYMBOL: Tick(NOW, 1.1, 1.10005)},
         clock=SimClock(NOW),
         candle_data={(SYMBOL, "H1"): bars},
-        session_hours={SYMBOL: sessions},
     )
 
 
@@ -79,7 +94,7 @@ def _symbol_settings(*, enabled: bool = True) -> SymbolSettings:
     )
 
 
-def test_validate_symbol_passes_with_six_months_of_simulated_history() -> None:
+def test_validate_symbol_reports_server_hours_and_out_of_session_candles() -> None:
     report = validate_symbol(
         _broker(),
         SYMBOL,
@@ -89,13 +104,16 @@ def test_validate_symbol_passes_with_six_months_of_simulated_history() -> None:
         cost_gate_pct_of_risk=15,
         max_stop_atr=3,
         now_utc=NOW,
+        server_session_hours=BrokerSessionHoursServerTime(),
     )
 
-    assert report.passed
-    assert report.issues == ()
+    assert not report.passed
     assert report.history_bars >= 183 * 24
     assert report.suggested_hours_utc == SESSIONS
     assert report.suggested_hours_utc_season == "US summer"
+    assert len(report.weekday_candle_times) == 7
+    assert any("outside broker session hours" in issue for issue in report.issues)
+    assert not any("session hour(s) have no candle" in issue for issue in report.issues)
 
 
 def test_oversized_minimum_lot_reports_below_min_lot_without_enabling_symbol() -> None:
@@ -109,6 +127,7 @@ def test_oversized_minimum_lot_reports_below_min_lot_without_enabling_symbol() -
         cost_gate_pct_of_risk=15,
         max_stop_atr=3,
         now_utc=NOW,
+        server_session_hours=BrokerSessionHoursServerTime(),
     )
 
     assert not report.passed
@@ -117,26 +136,195 @@ def test_oversized_minimum_lot_reports_below_min_lot_without_enabling_symbol() -
     assert settings.enabled is False
 
 
-def test_validate_symbol_rejects_overlapping_or_missing_friday_sessions() -> None:
-    sessions = (
-        "mon 00:00-12:00",
-        "mon 11:00-21:55",
-        "tue 00:00-21:55",
+def test_session_candle_check_flags_outside_and_missing_expected_hours() -> None:
+    start = datetime(2026, 7, 5, 23, tzinfo=UTC)
+    candles = tuple(
+        Candle(
+            time=timestamp,
+            open=1.1,
+            high=1.10025,
+            low=1.09975,
+            close=1.1,
+        )
+        for timestamp in (
+            start,
+            datetime(2026, 7, 6, 0, tzinfo=UTC),
+            datetime(2026, 7, 6, 21, tzinfo=UTC),
+        )
     )
+    outside, missing = _check_session_candles(
+        candles,
+        BrokerSessionHoursServerTime(),
+        cutoff=start - timedelta(hours=1),
+        end_utc=datetime(2026, 7, 7, tzinfo=UTC),
+    )
+
+    assert datetime(2026, 7, 6, 21, tzinfo=UTC) in outside
+    assert datetime(2026, 7, 6, 1, tzinfo=UTC) in missing
+
+
+def test_disabled_symbol_does_not_receive_a_server_session_schedule() -> None:
     report = validate_symbol(
-        _broker(sessions=sessions),
+        _broker(),
         SYMBOL,
-        _symbol_settings(),
+        _symbol_settings(enabled=False),
         equity=3_000,
         risk_per_trade_pct=0.5,
         cost_gate_pct_of_risk=15,
         max_stop_atr=3,
         now_utc=NOW,
+        server_session_hours=BrokerSessionHoursServerTime(),
     )
 
-    assert not report.passed
-    assert any("overlap" in issue.lower() for issue in report.issues)
-    assert any("Friday" in issue for issue in report.issues)
+    assert not report.enabled
+    assert report.suggested_hours_utc == ()
+    assert report.suggested_hours_utc_season is None
+
+
+def _prepare_validation_cli(monkeypatch, symbols: tuple[str, ...]):
+    source = Path(__file__).parents[1] / "settings.toml"
+    settings, _ = load_settings(source)
+    settings = settings.model_copy(
+        update={
+            "account": settings.account.model_copy(update={"expected_server": "Demo"}),
+            "symbols": {name: settings.symbols[name] for name in symbols},
+        }
+    )
+    def load_for_test(path: Path):
+        assert path.name == "settings.toml"
+        return settings, "settings-hash"
+
+    monkeypatch.setattr(validate_symbols_tool, "load_settings", load_for_test)
+    monkeypatch.setattr(
+        validate_symbols_tool,
+        "load_runtime_secrets",
+        lambda: RuntimeSecrets(
+            123456,
+            "demo-secret",
+            "telegram-secret",
+            "https://health-secret",
+        ),
+    )
+
+    class FakeCliBroker:
+        shutdown_called = False
+
+        def connect(self, **kwargs) -> bool:
+            assert set(kwargs) == {"login", "server"}
+            return True
+
+        def account(self) -> BrokerAccount:
+            return BrokerAccount(
+                123456,
+                "Demo",
+                "USD",
+                3_000,
+                3_000,
+                True,
+                True,
+                "netting",
+            )
+
+        def terminal_info(self) -> BrokerTerminalInfo:
+            return BrokerTerminalInfo(True, True, "Fake MT5", "Fake")
+
+        def server_utc_offset_hours(self) -> int:
+            return 2
+
+        def shutdown(self) -> None:
+            self.shutdown_called = True
+
+    broker = FakeCliBroker()
+    monkeypatch.setattr(validate_symbols_tool, "MT5Broker", lambda: broker)
+    return broker
+
+
+def test_validate_symbols_continues_after_failure_and_redacts_secrets(
+    monkeypatch,
+    capsys,
+) -> None:
+    broker = _prepare_validation_cli(monkeypatch, ("EURUSD", "GBPUSD"))
+    calls: list[str] = []
+
+    def validate_one(broker_arg, symbol: str, symbol_settings, **kwargs):
+        assert broker_arg is broker
+        assert symbol_settings.enabled
+        assert "server_session_hours" in kwargs
+        calls.append(symbol)
+        if symbol == "EURUSD":
+            raise RuntimeError("failed with demo-secret")
+        return SymbolValidationReport(
+            symbol,
+            True,
+            True,
+            4_000,
+            1.0,
+            ("sun 22:01-24:00",),
+            "US winter",
+            (),
+        )
+
+    monkeypatch.setattr(validate_symbols_tool, "validate_symbol", validate_one)
+
+    assert validate_symbols_tool.main([]) == 1
+
+    output = capsys.readouterr().out
+    assert calls == ["EURUSD", "GBPUSD"]
+    assert "GBPUSD" in output
+    assert "EURUSD: validation raised RuntimeError" in output
+    assert "demo-secret" not in output
+    assert "telegram-secret" not in output
+    assert "123456" not in output
+    assert broker.shutdown_called
+
+
+def test_validate_symbols_requires_review_confirmation_before_writing(
+    monkeypatch,
+    capsys,
+) -> None:
+    broker = _prepare_validation_cli(monkeypatch, ("EURUSD",))
+
+    def validate_one(broker_arg, symbol, symbol_settings, **kwargs):
+        assert broker_arg is broker
+        assert symbol_settings.enabled
+        assert "server_session_hours" in kwargs
+        return SymbolValidationReport(
+            symbol,
+            True,
+            True,
+            4_000,
+            1.0,
+            ("sun 22:01-24:00", "mon 00:00-21:59"),
+            "US winter",
+            (),
+        )
+
+    monkeypatch.setattr(
+        validate_symbols_tool,
+        "validate_symbol",
+        validate_one,
+    )
+    writes: list[object] = []
+    monkeypatch.setattr(
+        validate_symbols_tool,
+        "write_hours_utc",
+        lambda *args: writes.append(args),
+    )
+
+    def decline_write(prompt: str) -> str:
+        assert "APPLY" in prompt
+        report_output = capsys.readouterr().out
+        assert "SYMBOL  ENABLED" in report_output
+        assert "suggested hours_utc" in report_output
+        return "no"
+
+    monkeypatch.setattr("builtins.input", decline_write)
+
+    assert validate_symbols_tool.main(["--write"]) == 0
+
+    assert writes == []
+    assert "No settings were written." in capsys.readouterr().out
+    assert broker.shutdown_called
 
 
 @pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
@@ -177,7 +365,7 @@ def test_write_hours_utc_changes_only_symbol_hours(
         for line in original.splitlines()
         if not line.startswith(("hours_utc", "hours_utc_season"))
     ]
-    assert 'hours_utc = ["mon 00:00-21:55"' in updated
+    assert 'hours_utc = ["sun 21:01-24:00"' in updated
     assert 'hours_utc_season = "US summer"' in updated
     parsed = tomllib.loads(updated)
     assert tuple(parsed["symbols"][SYMBOL]["hours_utc"]) == SESSIONS

@@ -21,9 +21,9 @@
 
 ## Remaining owner actions
 
-- Run `validate_symbols.py` on the owner's demo terminal and review the broker-derived schedules
-  before applying them to `bot_trader/settings.toml`. Keep enabled-symbol schedules empty until then;
-  do not use the unverified `bot_trader/config/sessions.toml` example.
+- Run `validate_symbols.py` on the owner's demo terminal and review the H1/time-offset report before
+  applying the configured server-time schedule to `bot_trader/settings.toml`. Keep enabled-symbol
+  UTC schedules empty until review; the tool does not read sessions from MT5.
 - Supply and verify a real economic-calendar source/path and UTC events. Do not treat the checked-in
   sample calendar as acceptance data.
 - Complete the MT5 demo-terminal clock cross-check and remaining demo runtime/restart/control drills.
@@ -33,3 +33,5 @@
 ## Later question
 
 - Consider a separate verified-through date for quiet periods.
+- Should missing expected H1 candle slots on broker-declared market holidays be treated as
+  validation failures, or reported separately from unexpected data gaps?

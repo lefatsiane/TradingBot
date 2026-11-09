@@ -348,6 +348,7 @@ def _log_minimum_lot_startup_report(
             cost_gate_pct_of_risk=settings.risk.cost_gate_pct_of_risk,
             max_stop_atr=max_stop_atr,
             now_utc=clock.now_utc().astimezone(UTC),
+            server_session_hours=settings.broker_session_hours_server_time,
         )
         if "BELOW_MIN_LOT" in report.issues:
             logger.warning(

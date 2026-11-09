@@ -11,6 +11,50 @@ from bot.adapters.broker import OrderRequest
 from bot.adapters.mt5_broker import MT5Broker, MT5ReadOnlyBroker
 from bot.core.types import Side
 
+_MT5_PACKAGE_FUNCTIONS = frozenset(
+    {
+        "initialize",
+        "login",
+        "shutdown",
+        "version",
+        "last_error",
+        "account_info",
+        "terminal_info",
+        "symbols_total",
+        "symbols_get",
+        "symbol_info",
+        "symbol_info_tick",
+        "symbol_select",
+        "market_book_add",
+        "market_book_get",
+        "market_book_release",
+        "copy_rates_from",
+        "copy_rates_from_pos",
+        "copy_rates_range",
+        "copy_ticks_from",
+        "copy_ticks_range",
+        "orders_total",
+        "orders_get",
+        "order_calc_margin",
+        "order_calc_profit",
+        "order_check",
+        "order_send",
+        "positions_total",
+        "positions_get",
+        "history_orders_total",
+        "history_orders_get",
+        "history_deals_total",
+        "history_deals_get",
+    }
+)
+
+
+class StrictFakeMT5:
+    def __getattr__(self, name: str) -> object:
+        if name not in _MT5_PACKAGE_FUNCTIONS:
+            raise AssertionError(f"Unsupported MetaTrader5 API name: {name}")
+        raise AssertionError(f"Fake MetaTrader5 API function is not implemented: {name}")
+
 
 @dataclass(frozen=True)
 class SymbolRecord:
@@ -34,7 +78,7 @@ class TickRecord:
     ask: float = 1.1001
 
 
-class FakeMT5:
+class FakeMT5(StrictFakeMT5):
     TIMEFRAME_H1 = 60
     TIMEFRAME_H4 = 240
 
@@ -168,7 +212,7 @@ def test_mt5_adapter_rejects_naive_history_range() -> None:
         )
 
 
-class FakeLiveMT5API:
+class FakeLiveMT5API(StrictFakeMT5):
     TIMEFRAME_H1 = 60
     TIMEFRAME_H4 = 240
     TRADE_ACTION_DEAL = 1
@@ -202,6 +246,10 @@ class FakeLiveMT5API:
     TRADE_RETCODE_PRICE_OFF = 10021
     TRADE_RETCODE_CONNECTION = 10031
     TRADE_RETCODE_UNKNOWN = 10008
+    DEAL_ENTRY_IN = 0
+    DEAL_ENTRY_OUT = 1
+    DEAL_ENTRY_INOUT = 2
+    DEAL_ENTRY_OUT_BY = 3
 
     def __init__(
         self,
@@ -228,7 +276,6 @@ class FakeLiveMT5API:
         self.positions_result: list[SimpleNamespace] | None = None
         self.history_result: list[SimpleNamespace] | None = None
         self.symbol_select_result = True
-        self.trading_sessions: dict[int, list[tuple[int, int]]] = {}
         self._tick = SimpleNamespace(
             time=1_767_620_400,
             time_msc=1_767_620_400_250,
@@ -287,18 +334,6 @@ class FakeLiveMT5API:
 
     def symbol_select(self, symbol: str, enable: bool) -> bool:
         return self.symbol_select_result
-
-    def symbol_info_session_trade(
-        self,
-        symbol: str,
-        day_of_week: int,
-        session_index: int,
-    ) -> SimpleNamespace | None:
-        day_sessions = self.trading_sessions.get(day_of_week, [])
-        if session_index >= len(day_sessions):
-            return None
-        start, end = day_sessions[session_index]
-        return SimpleNamespace(**{"from": start, "to": end})
 
     def symbol_info_tick(self, symbol: str) -> SimpleNamespace:
         assert symbol == "EURUSD"
@@ -612,32 +647,10 @@ def test_mt5_broker_reads_terminal_symbol_and_tick() -> None:
     assert candles
 
 
-def test_mt5_broker_converts_symbol_sessions_to_utc_and_splits_midnight() -> None:
-    api = FakeLiveMT5API()
-    api.trading_sessions = {
-        0: [(2 * 60 * 60, 22 * 60 * 60)],
-        1: [(0, 3 * 60 * 60)],
-    }
-    broker = MT5Broker(
-        api=api,
-        server_clock_sanity_provider=lambda: 2,
-    )
-
-    assert broker.symbol_sessions_utc("EURUSD") == (
-        "mon 00:00-20:00",
-        "mon 22:00-23:59",
-        "tue 00:00-01:00",
-    )
-
-
-def test_mt5_broker_rejects_symbols_without_trading_sessions() -> None:
-    broker = MT5Broker(
-        api=FakeLiveMT5API(),
-        server_clock_sanity_provider=lambda: 2,
-    )
-
-    with pytest.raises(RuntimeError, match="no trading sessions"):
-        broker.symbol_sessions_utc("EURUSD")
+def test_fake_mt5_rejects_functions_not_in_the_real_package_api() -> None:
+    unsupported_name = "not_a_real_mt5_function"
+    with pytest.raises(AssertionError, match="Unsupported MetaTrader5 API name"):
+        getattr(FakeLiveMT5API(), unsupported_name)
 
 
 def test_mt5_broker_returns_empty_reads_without_requiring_market_tick() -> None:

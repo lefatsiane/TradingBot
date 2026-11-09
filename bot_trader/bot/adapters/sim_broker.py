@@ -100,7 +100,6 @@ class SimBroker:
     terminal_name: str = "SimBroker"
     company: str = "Simulated"
     costs: dict[str, SimCosts] = field(default_factory=dict)
-    session_hours: dict[str, tuple[str, ...]] = field(default_factory=dict)
     _positions: dict[str, BrokerPosition] = field(default_factory=dict, init=False)
     _deals: list[BrokerDeal] = field(default_factory=list, init=False)
     _last_candle_times: dict[str, datetime] = field(default_factory=dict, init=False)
@@ -124,12 +123,6 @@ class SimBroker:
         if unknown_cost_symbols:
             raise ValueError(
                 f"Costs configured for unknown symbols: {', '.join(sorted(unknown_cost_symbols))}"
-            )
-        unknown_session_symbols = set(self.session_hours) - set(self.specs)
-        if unknown_session_symbols:
-            raise ValueError(
-                "Sessions configured for unknown symbols: "
-                f"{', '.join(sorted(unknown_session_symbols))}"
             )
         self._balance = self.account_snapshot.balance
 
@@ -155,13 +148,6 @@ class SimBroker:
             return self.specs[symbol]
         except KeyError as error:
             raise ValueError(f"Unknown simulated symbol: {symbol}") from error
-
-    def symbol_sessions_utc(self, symbol: str) -> tuple[str, ...]:
-        self._require_connection()
-        try:
-            return self.session_hours[symbol]
-        except KeyError as error:
-            raise ValueError(f"No simulated sessions configured for {symbol}") from error
 
     def candles(self, symbol: str, timeframe: str) -> tuple[Candle, ...]:
         self._require_connection()

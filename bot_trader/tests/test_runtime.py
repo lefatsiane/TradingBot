@@ -128,7 +128,6 @@ def test_runtime_clean_shutdown_leaves_protected_positions_open(tmp_path) -> Non
         {"EURUSD": SPEC},
         {"EURUSD": Tick(clock.now_utc(), 1.1, 1.1001)},
         clock=clock,
-        session_hours={"EURUSD": settings.symbols["EURUSD"].hours_utc},
     )
     store = StateStore(tmp_path / "runtime.db")
     gateway = BrokerGateway(broker, max_retries=0)

@@ -30,7 +30,6 @@ SERVER_OFFSET_MAX_TICK_AGE_S = 60
 SERVER_OFFSET_SAMPLE_COUNT = 3
 SERVER_OFFSET_MAX_SAMPLE_ATTEMPTS = 30
 SERVER_OFFSET_SAMPLE_INTERVAL_S = 0.1
-_WEEKDAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
 class _SymbolInfo(Protocol):
@@ -106,13 +105,6 @@ class _MT5API(Protocol):
     def symbol_info(self, symbol: str) -> _SymbolInfo | None: ...
 
     def symbol_select(self, symbol: str, enable: bool) -> bool: ...
-
-    def symbol_info_session_trade(
-        self,
-        symbol: str,
-        day_of_week: int,
-        session_index: int,
-    ) -> object | None: ...
 
     def symbol_info_tick(self, symbol: str) -> _TickInfo | None: ...
 
@@ -367,82 +359,6 @@ class MT5Broker:
             volume_max=float(getattr(info, "volume_max", 100.0)),
             digits=int(getattr(info, "digits", 5)),
             contract_size=float(getattr(info, "trade_contract_size", 100_000.0)),
-        )
-
-    def symbol_sessions_utc(self, symbol: str) -> tuple[str, ...]:
-        self.symbol_info(symbol)
-        offset_hours = self.server_utc_offset_hours()
-        windows: list[tuple[int, int, int]] = []
-        for weekday in range(7):
-            session_index = 0
-            while True:
-                session = self._api.symbol_info_session_trade(
-                    symbol,
-                    weekday,
-                    session_index,
-                )
-                if session is None:
-                    break
-                raw_start = getattr(session, "from", None)
-                raw_end = getattr(session, "to", None)
-                if (
-                    isinstance(raw_start, bool)
-                    or not isinstance(raw_start, int)
-                    or isinstance(raw_end, bool)
-                    or not isinstance(raw_end, int)
-                    or raw_start < 0
-                    or raw_start >= 24 * 60 * 60
-                    or raw_end < 0
-                    or raw_end > 24 * 60 * 60
-                ):
-                    raise ValueError(f"Invalid MT5 session times for {symbol}")
-                if raw_end == raw_start:
-                    session_index += 1
-                    continue
-                end_seconds = raw_end
-                if end_seconds < raw_start:
-                    end_seconds += 24 * 60 * 60
-                if end_seconds - raw_start > 24 * 60 * 60:
-                    raise ValueError(f"MT5 session exceeds 24 hours for {symbol}")
-                start_week_seconds = (
-                    weekday * 24 * 60 * 60
-                    + raw_start
-                    - offset_hours * 60 * 60
-                )
-                end_week_seconds = (
-                    weekday * 24 * 60 * 60
-                    + end_seconds
-                    - offset_hours * 60 * 60
-                )
-                while start_week_seconds < end_week_seconds:
-                    day_index = start_week_seconds // (24 * 60 * 60)
-                    segment_end = min(
-                        end_week_seconds,
-                        (day_index + 1) * 24 * 60 * 60,
-                    )
-                    start_minute = (start_week_seconds + 59) // 60
-                    end_minute = segment_end // 60
-                    if end_minute > start_minute:
-                        open_minute = start_minute % (24 * 60)
-                        close_minute = end_minute - day_index * 24 * 60
-                        windows.append(
-                            (
-                                day_index % 7,
-                                open_minute,
-                                min(close_minute, 24 * 60 - 1),
-                            )
-                        )
-                    start_week_seconds = segment_end
-                session_index += 1
-
-        if not windows:
-            raise RuntimeError(f"MT5 returned no trading sessions for {symbol}")
-        windows.sort()
-        return tuple(
-            f"{_WEEKDAY_NAMES[weekday]} "
-            f"{open_minute // 60:02}:{open_minute % 60:02}-"
-            f"{close_minute // 60:02}:{close_minute % 60:02}"
-            for weekday, open_minute, close_minute in windows
         )
 
     def candles(self, symbol: str, timeframe: str) -> tuple[Candle, ...]:
