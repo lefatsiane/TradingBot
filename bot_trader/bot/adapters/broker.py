@@ -37,6 +37,7 @@ class Tick:
     time_utc: datetime
     bid: float
     ask: float
+    time_server_epoch: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

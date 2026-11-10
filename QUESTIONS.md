@@ -35,3 +35,10 @@
 - Consider a separate verified-through date for quiet periods.
 - Should missing expected H1 candle slots on broker-declared market holidays be treated as
   validation failures, or reported separately from unexpected data gaps?
+- Does the existing five-day stale-history threshold mean five accumulated days of scheduled
+  market-open time? The validator currently uses that interpretation for failure and reports the
+  elapsed age of the last closed H1 candle separately.
+- How should the repeated server-clock H1 timestamp during the autumn DST rollback be resolved?
+  The wall-clock hour occurs twice and a raw server-wall timestamp alone cannot identify which UTC
+  hour it represents; confirm whether MT5 returns an additional disambiguating field or omits one
+  of the repeated bars.

@@ -77,6 +77,15 @@ def broker_to_utc(server_epoch: int, server_offset_hours: int) -> datetime:
     return (server_wall_time - timedelta(hours=server_offset_hours)).replace(tzinfo=UTC)
 
 
+def utc_to_broker_wall_time(utc_time: datetime) -> datetime:
+    """Encode a UTC instant as the broker's server wall time for MT5 date inputs."""
+    at_utc = _require_utc(utc_time)
+    server_wall_time = at_utc + timedelta(
+        hours=expected_new_york_offset(at_utc)
+    )
+    return server_wall_time.replace(tzinfo=UTC)
+
+
 def _server_midnight_to_utc(server_midnight: datetime) -> datetime:
     for offset_hours in (2, 3):
         candidate = (server_midnight - timedelta(hours=offset_hours)).replace(tzinfo=UTC)

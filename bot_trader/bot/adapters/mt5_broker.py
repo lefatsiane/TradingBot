@@ -22,6 +22,7 @@ from bot.core.timeutil import (
     broker_wall_time_to_utc,
     expected_new_york_offset,
     rounded_server_offset_from_tick,
+    utc_to_broker_wall_time,
 )
 from bot.core.types import Candle, Side, SymbolSpec
 
@@ -198,7 +199,7 @@ class MT5ReadOnlyBroker:
         }.get(timeframe)
         if timeframe_constant is None:
             raise ValueError(f"Unsupported MT5 history timeframe: {timeframe}")
-        now = datetime.now(tz=UTC)
+        now = _require_utc(self._clock(), "clock")
         end = self._history_end_utc or now
         start = self._history_start_utc or end - timedelta(days=365 * 6)
         rates_by_time: dict[int, _Rate] = {}
@@ -208,8 +209,8 @@ class MT5ReadOnlyBroker:
             rates = self._api.copy_rates_range(
                 symbol,
                 timeframe_constant,
-                cursor,
-                chunk_end,
+                utc_to_broker_wall_time(cursor),
+                utc_to_broker_wall_time(chunk_end),
             )
             if rates is None:
                 raise RuntimeError(
@@ -241,7 +242,12 @@ class MT5ReadOnlyBroker:
         if info is None:
             return None
         server_epoch = info.time_msc / 1_000 if info.time_msc else info.time
-        return Tick(broker_wall_time_to_utc(server_epoch), info.bid, info.ask)
+        return Tick(
+            broker_wall_time_to_utc(server_epoch),
+            info.bid,
+            info.ask,
+            server_epoch,
+        )
 
     def server_utc_offset_hours(self) -> int:
         return expected_new_york_offset(_require_utc(self._clock(), "clock"))
@@ -378,6 +384,7 @@ class MT5Broker:
             broker_wall_time_to_utc(server_epoch),
             float(info.bid),
             float(info.ask),
+            server_epoch,
         )
 
     def server_utc_offset_hours(self) -> int:
@@ -510,7 +517,7 @@ class MT5Broker:
         return tuple(positions)
 
     def history_deals(self, since_utc: datetime, magic_number: int) -> tuple[BrokerDeal, ...]:
-        raw = self._api.history_deals_get(since_utc)
+        raw = self._api.history_deals_get(utc_to_broker_wall_time(since_utc))
         if raw is None:
             raise RuntimeError(f"MetaTrader 5 history_deals_get failed: {self._api.last_error()}")
         if not raw:
