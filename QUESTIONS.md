@@ -42,3 +42,9 @@
   The wall-clock hour occurs twice and a raw server-wall timestamp alone cannot identify which UTC
   hour it represents; confirm whether MT5 returns an additional disambiguating field or omits one
   of the repeated bars.
+- `config/known_gaps.csv` intentionally contains only its header and an explanatory comment. The
+  validator treats "mid-week" as Tuesday through Thursday, and requires exact approved start/end
+  bounds and missing-candle count. Confirm this definition before adding any owner-approved row.
+- `--report-gaps` has been implemented without being run because it requires MT5. The broker-wide
+  December 2021 outage and the June 2026 gaps therefore remain unverified against a complete,
+  all-jobs download; the owner must run the report mode and review its full output.

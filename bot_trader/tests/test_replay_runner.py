@@ -13,7 +13,7 @@ from bot.adapters.broker import BrokerAccount
 from bot.adapters.sim_broker import SimCosts
 from bot.app.backtest import run_strategy_a_backtest
 from bot.app.config import build_simulator_costs, load_settings
-from bot.app.data import DataQualityError
+from bot.app.data import DataQualityError, Timeframe
 from bot.app.replay_runner import (
     _simulator_costs,
     _tick_for_candle,
@@ -109,7 +109,7 @@ def _settings():
     return settings.model_copy(update={"symbols": symbols})
 
 
-def _histories(start: datetime) -> dict[tuple[str, str], tuple[Candle, ...]]:
+def _histories(start: datetime) -> dict[tuple[str, Timeframe], tuple[Candle, ...]]:
     h1 = tuple(
         Candle(
             start + timedelta(hours=index),
@@ -162,6 +162,20 @@ def test_engine_replay_uses_simulator_and_writes_auditable_report(tmp_path) -> N
         code_version="unit-test-commit",
         settings_version="unit-test-settings",
         cost_multiplier=2.0,
+        accepted_gaps=(
+            {
+                "symbol": "EURUSD",
+                "timeframe": "H1",
+                "start_utc": "2026-06-30T09:00:00+00:00",
+                "end_utc": "2026-06-30T11:00:00+00:00",
+                "missing_candles": 2,
+                "known": True,
+                "accepted": True,
+                "approval_reason": "unit-test approval",
+                "approved_by": "owner",
+                "approved_on": "2026-11-11",
+            },
+        ),
     )
 
     assert result.news_enabled is False
@@ -179,6 +193,7 @@ def test_engine_replay_uses_simulator_and_writes_auditable_report(tmp_path) -> N
     assert summary["settings_version"] == "unit-test-settings"
     assert summary["cost_multiplier"] == 2.0
     assert summary["strategy_parameters"]["A"]["ema_fast"] == 16
+    assert len(summary["accepted_history_gaps"]) == 1
 
 
 def test_engine_replay_rejects_recent_history_without_final_flag() -> None:

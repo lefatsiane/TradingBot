@@ -62,6 +62,7 @@ class ReplayRunResult:
     news_enabled: bool
     final_run: bool
     report_dir: Path | None = None
+    accepted_gaps: tuple[dict[str, object], ...] = ()
 
 
 def run_replay(
@@ -83,6 +84,7 @@ def run_replay(
     strategy_b_params: StrategyBParams | None = None,
     random_entry_schedule: Mapping[RandomEntryKey, Side] | None = None,
     random_entry_targets: Mapping[str, int] | None = None,
+    accepted_gaps: tuple[dict[str, object], ...] = (),
 ) -> ReplayRunResult:
     """Replay cached candles through the production Engine, Executor and SimBroker."""
     now = _require_utc(now_utc, "now_utc")
@@ -127,6 +129,9 @@ def run_replay(
         else tuple(dict.fromkeys((*settings.strategy_a.timeframes, "H1")))
     )
     selected_histories: dict[tuple[str, Timeframe], tuple[Candle, ...]] = {}
+    accepted_gaps_by_history: dict[
+        tuple[str, Timeframe], tuple[dict[str, object], ...]
+    ] = {}
     excluded_recent_bars = 0
     for symbol in enabled_symbols:
         if symbol not in specs or specs[symbol].name != symbol:
@@ -136,11 +141,18 @@ def run_replay(
             candles = histories.get(key)
             if candles is None:
                 raise DataQualityError(f"Missing cached history for {symbol} {timeframe}")
+            matching_gaps = tuple(
+                gap
+                for gap in accepted_gaps
+                if gap.get("symbol") == symbol and gap.get("timeframe") == timeframe
+            )
+            accepted_gaps_by_history[key] = matching_gaps
             selected, excluded = select_backtest_history(
                 candles,
                 timeframe,
                 now_utc=now,
                 final=final,
+                accepted_gaps=matching_gaps,
             )
             selected_histories[key] = selected
             excluded_recent_bars += excluded
@@ -209,6 +221,7 @@ def run_replay(
         strategy_b_params=strategy_b_params,
         random_entry_schedule=random_entry_schedule,
         random_entry_targets=random_entry_targets,
+        accepted_history_gaps=accepted_gaps_by_history,
     )
 
     decisions: list[Decision] = []
@@ -302,6 +315,7 @@ def run_replay(
             excluded_recent_bars=excluded_recent_bars,
             news_enabled=not no_news,
             final_run=final,
+            accepted_gaps=accepted_gaps,
         )
         if report_root is not None:
             result = replace(
@@ -407,6 +421,7 @@ def write_replay_report(
         "ending_equity": result.ending_equity,
         "net_profit": result.ending_equity - result.starting_equity,
         "excluded_recent_bars": result.excluded_recent_bars,
+        "accepted_history_gaps": list(result.accepted_gaps),
         "decision_count": len(result.decisions),
         "trade_count": sum(
             any(deal.is_entry is True for deal in items)

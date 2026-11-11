@@ -109,6 +109,7 @@ def write_backtest_report(
         "ending_equity": result.ending_equity,
         "excluded_recent_bars": result.excluded_recent_bars,
         "history_gap_count": result.history_gap_count,
+        "accepted_history_gaps": list(result.accepted_gaps),
         "skipped_cost": result.skipped_cost,
         "skipped_size": result.skipped_size,
         "skipped_risk": result.skipped_risk,

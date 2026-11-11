@@ -10,7 +10,7 @@ from bot.adapters.broker import OrderRequest, Tick
 from bot.adapters.gateway import BrokerGateway
 from bot.adapters.store import AlertPayload, DecisionRecord, StateStore
 from bot.app.config import Settings, sessions_for_utc, startup_guard
-from bot.app.data import DataQualityError, last_closed_candles
+from bot.app.data import DataQualityError, accepted_gap_times, last_closed_candles
 from bot.app.executor import Executor
 from bot.app.news import (
     NewsEvent,
@@ -507,6 +507,9 @@ class Engine:
         strategy_b_params: StrategyBParams | None = None,
         random_entry_schedule: Mapping[RandomEntryKey, Side] | None = None,
         random_entry_targets: Mapping[str, int] | None = None,
+        accepted_history_gaps: Mapping[
+            tuple[str, str], tuple[dict[str, object], ...]
+        ] | None = None,
     ) -> None:
         if strategy_mode not in ("a", "b", "both"):
             raise ValueError("strategy_mode must be 'a', 'b', or 'both'")
@@ -533,6 +536,7 @@ class Engine:
         self._random_entry_schedule = random_entry_schedule or {}
         self._random_entry_remaining = dict(random_entry_targets or {})
         self._random_entry_control = random_entry_schedule is not None
+        self._accepted_history_gaps = dict(accepted_history_gaps or {})
         self._news_events: tuple[NewsEvent, ...] = ()
         self._news_calendar_valid: bool | None = None
         self._instance_lock_file: BinaryIO | None = None
@@ -572,7 +576,17 @@ class Engine:
                     now = _as_utc(self._clock.now_utc())
                     try:
                         raw = self._gateway.candles(symbol, timeframe)
-                        closed = last_closed_candles(raw, timeframe, now_utc=now)
+                        closed = last_closed_candles(
+                            raw,
+                            timeframe,
+                            now_utc=now,
+                            allowed_gap_times=accepted_gap_times(
+                                self._accepted_history_gaps.get(
+                                    (symbol, timeframe), ()
+                                ),
+                                timeframe,
+                            ),
+                        )
                     except DataQualityError as error:
                         alert_key = f"entry_data_error_alerted:{symbol}:{timeframe}"
                         if self._store.get_meta(alert_key) != "1":
@@ -1268,7 +1282,15 @@ class Engine:
                 if trade.strategy != "B" or trade.timeframe != "H1":
                     continue
                 candles = self._gateway.candles(trade.symbol, "H1")
-                closed = last_closed_candles(candles, "H1", now_utc=now)
+                closed = last_closed_candles(
+                    candles,
+                    "H1",
+                    now_utc=now,
+                    allowed_gap_times=accepted_gap_times(
+                        self._accepted_history_gaps.get((trade.symbol, "H1"), ()),
+                        "H1",
+                    ),
+                )
                 opened_at = datetime.fromisoformat(trade.opened_at_utc)
                 if (
                     sum(candle.time > opened_at for candle in closed)

@@ -199,24 +199,41 @@ next day. A session crossing midnight must otherwise be split across weekdays.
 
 ## Cache history and run a provisional replay
 
-With the intended MT5 terminal already available, cache the enabled symbols:
+First download and report every gap without writing a cache. This command requires
+the owner's open MT5 terminal; do not run it without that terminal:
 
 ```powershell
-python tools/cache_history.py --settings settings.toml --start-utc 2021-12-02T16:00:00+00:00
+python tools/cache_history.py --settings settings.toml --start-utc 2021-12-03T00:00:00+00:00 --report-gaps
 ```
 
-The cache command validates closed bars and fails on unexplained gaps. The start
-above avoids the currently unresolved EURUSD H1 gap; it also means this dataset
-does not cover six full years. Run a single-symbol Strategy A H1 replay and save
-multi-symbol trades, decisions, equity curve, and summary:
+`--report-gaps` never writes cache files and lists every unexpected gap with its
+symbol, timeframe, UTC bounds, missing-candle count, and weekday. After reviewing
+the report, an owner may add approved rows to `config/known_gaps.csv`; the bot
+does not create approvals. Only exact approved gaps of at most two consecutive
+missing candles on Tuesday through Thursday are accepted. Accepted gaps appear
+in each cache manifest and in replay/backtest summaries. Any other unexpected
+gap prevents cache creation. Manifests record years covered against the six-year
+design target.
+
+After review, cache history and validate the resulting data locally:
+
+```powershell
+python tools/cache_history.py --settings settings.toml --start-utc 2021-12-03T00:00:00+00:00
+python tools/validate_cache.py --settings settings.toml
+```
+
+`validate_cache.py` is read-only and uses neither network nor MT5. It checks UTC
+candle order/duplicates, sessions and weekends, expected/known/unexpected gaps,
+OHLC/prices, weekly opens/closes across US clock changes, and six-year coverage.
+It exits non-zero for failed checks. Do not repair or interpolate missing bars.
+Replay requires reviewed `hours_utc` schedules and validated caches for every
+enabled symbol/timeframe. The owner must review/apply broker-derived hours before
+running it:
 
 ```powershell
 python tools/replay.py --settings settings.toml --strategy both --no-news
 ```
 
-Replay requires reviewed `hours_utc` schedules and validated caches for every
-enabled symbol/timeframe. The checked-in template intentionally has empty
-schedules, so the owner must review/apply broker-derived hours before running it.
 News gating stays enabled by default; `--no-news` is explicit and recorded in the
 report. By default, the most recent 12 months are excluded. Use `--final` only
 for the final evaluation run; it creates `data/reports/final-holdout.lock` with

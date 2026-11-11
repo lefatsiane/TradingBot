@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -128,8 +130,50 @@ def test_replay_excludes_recent_twelve_months_without_final_flag() -> None:
     assert final_excluded == 0
 
 
+def test_backtest_history_requires_explicit_approval_for_short_midweek_gap() -> None:
+    start = datetime(2026, 6, 30, 8, tzinfo=UTC)
+    candles = (
+        Candle(start, 1.1, 1.101, 1.099, 1.1),
+        Candle(start + timedelta(hours=3), 1.1, 1.101, 1.099, 1.1),
+    )
+    approved = {
+        "symbol": "EURUSD",
+        "timeframe": "H1",
+        "start_utc": (start + timedelta(hours=1)).isoformat(),
+        "end_utc": (start + timedelta(hours=3)).isoformat(),
+        "missing_candles": 2,
+        "known": True,
+        "accepted": True,
+        "approval_reason": "unit-test approval",
+        "approved_by": "owner",
+        "approved_on": "2026-11-11",
+    }
+
+    selected, _ = select_backtest_history(
+        candles,
+        "H1",
+        now_utc=start + timedelta(hours=4),
+        final=True,
+        accepted_gaps=(approved,),
+    )
+
+    assert selected == candles
+
+
 def test_report_saves_trades_curve_and_metrics(tmp_path: Path) -> None:
-    result = run(backtest_candles())
+    gap = {
+        "symbol": "EURUSD",
+        "timeframe": "H1",
+        "start_utc": "2026-06-30T09:00:00+00:00",
+        "end_utc": "2026-06-30T11:00:00+00:00",
+        "missing_candles": 2,
+        "known": True,
+        "accepted": True,
+        "approval_reason": "unit-test approval",
+        "approved_by": "owner",
+        "approved_on": "2026-11-11",
+    }
+    result = replace(run(backtest_candles()), accepted_gaps=(gap,))
     metrics = backtest_metrics(result)
 
     report_dir = write_backtest_report(
@@ -143,3 +187,5 @@ def test_report_saves_trades_curve_and_metrics(tmp_path: Path) -> None:
     assert (report_dir / "trades.csv").is_file()
     assert (report_dir / "equity_curve.csv").is_file()
     assert (report_dir / "summary.json").is_file()
+    summary = json.loads((report_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["accepted_history_gaps"] == [gap]
