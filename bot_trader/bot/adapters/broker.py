@@ -37,6 +37,7 @@ class Tick:
     time_utc: datetime
     bid: float
     ask: float
+    time_server_epoch: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,8 +100,6 @@ class Broker(Protocol):
     def terminal_info(self) -> BrokerTerminalInfo: ...
 
     def symbol_info(self, symbol: str) -> SymbolSpec: ...
-
-    def symbol_sessions_utc(self, symbol: str) -> tuple[str, ...]: ...
 
     def candles(self, symbol: str, timeframe: str) -> tuple[Candle, ...]: ...
 

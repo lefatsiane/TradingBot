@@ -9,7 +9,57 @@ import pytest
 import bot.adapters.mt5_broker as mt5_module
 from bot.adapters.broker import OrderRequest
 from bot.adapters.mt5_broker import MT5Broker, MT5ReadOnlyBroker
+from bot.app.data import last_closed_candles
+from bot.core.timeutil import (
+    broker_wall_time_to_utc,
+    expected_new_york_offset,
+    utc_to_broker_wall_time,
+)
 from bot.core.types import Side
+
+_MT5_PACKAGE_FUNCTIONS = frozenset(
+    {
+        "initialize",
+        "login",
+        "shutdown",
+        "version",
+        "last_error",
+        "account_info",
+        "terminal_info",
+        "symbols_total",
+        "symbols_get",
+        "symbol_info",
+        "symbol_info_tick",
+        "symbol_select",
+        "market_book_add",
+        "market_book_get",
+        "market_book_release",
+        "copy_rates_from",
+        "copy_rates_from_pos",
+        "copy_rates_range",
+        "copy_ticks_from",
+        "copy_ticks_range",
+        "orders_total",
+        "orders_get",
+        "order_calc_margin",
+        "order_calc_profit",
+        "order_check",
+        "order_send",
+        "positions_total",
+        "positions_get",
+        "history_orders_total",
+        "history_orders_get",
+        "history_deals_total",
+        "history_deals_get",
+    }
+)
+
+
+class StrictFakeMT5:
+    def __getattr__(self, name: str) -> object:
+        if name not in _MT5_PACKAGE_FUNCTIONS:
+            raise AssertionError(f"Unsupported MetaTrader5 API name: {name}")
+        raise AssertionError(f"Fake MetaTrader5 API function is not implemented: {name}")
 
 
 @dataclass(frozen=True)
@@ -34,7 +84,7 @@ class TickRecord:
     ask: float = 1.1001
 
 
-class FakeMT5:
+class FakeMT5(StrictFakeMT5):
     TIMEFRAME_H1 = 60
     TIMEFRAME_H4 = 240
 
@@ -80,7 +130,27 @@ class FakeMT5:
         date_to: datetime,
     ) -> list[dict[str, int | float]]:
         self.range_requests.append((symbol, timeframe, date_from, date_to))
-        return self.rates
+        start_server_epoch = date_from.timestamp()
+        end_server_epoch = date_to.timestamp()
+        return [
+            rate
+            for rate in self.rates
+            if start_server_epoch <= int(rate["time"]) <= end_server_epoch
+        ]
+
+
+def _rate_at_utc(utc_time: datetime) -> dict[str, int | float]:
+    offset = expected_new_york_offset(utc_time)
+    server_wall_time = utc_time + timedelta(hours=offset)
+    return {
+        "time": int(server_wall_time.timestamp()),
+        "open": 1.1,
+        "high": 1.101,
+        "low": 1.099,
+        "close": 1.1005,
+        "spread": 10,
+        "tick_volume": 123,
+    }
 
 
 def test_mt5_adapter_maps_symbol_candles_spread_and_tick_to_utc() -> None:
@@ -102,16 +172,113 @@ def test_mt5_adapter_maps_symbol_candles_spread_and_tick_to_utc() -> None:
     assert spec.contract_size == 100_000
     assert candles[0].spread == pytest.approx(0.0001)
     assert candles[0].tick_volume == 123
-    assert candles[0].time == datetime.fromtimestamp(
-        1_767_620_400 - 2 * 60 * 60,
-        tz=UTC,
-    )
+    assert candles[0].time == broker_wall_time_to_utc(1_767_620_400)
     assert tick is not None
     assert tick.time_utc == datetime.fromtimestamp(
         1_767_620_400.25 - 2 * 60 * 60,
         tz=UTC,
     )
-    assert api.range_requests == [("EURUSD", api.TIMEFRAME_H1, start, end)]
+    assert tick.time_server_epoch == pytest.approx(1_767_620_400.25)
+    assert api.range_requests == [
+        (
+            "EURUSD",
+            api.TIMEFRAME_H1,
+            utc_to_broker_wall_time(start),
+            utc_to_broker_wall_time(end),
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "now",
+    [
+        datetime(2026, 11, 10, 8, 12, tzinfo=UTC),
+        datetime(2026, 7, 7, 8, 12, tzinfo=UTC),
+        datetime(2026, 3, 6, 8, 12, tzinfo=UTC),
+        datetime(2026, 3, 7, 8, 12, tzinfo=UTC),
+        datetime(2026, 3, 8, 10, 12, tzinfo=UTC),
+        datetime(2026, 3, 9, 8, 12, tzinfo=UTC),
+        datetime(2026, 10, 30, 8, 12, tzinfo=UTC),
+        datetime(2026, 10, 31, 8, 12, tzinfo=UTC),
+        datetime(2026, 11, 1, 10, 12, tzinfo=UTC),
+        datetime(2026, 11, 2, 8, 12, tzinfo=UTC),
+    ],
+)
+def test_server_clock_bar_times_and_range_bounds_yield_latest_closed_utc_bar(
+    now: datetime,
+) -> None:
+    forming_bar = now.replace(minute=0, second=0, microsecond=0)
+    bar_times = tuple(
+        forming_bar - timedelta(hours=hours_ago)
+        for hours_ago in (2, 1, 0)
+    )
+    api = FakeMT5()
+    api.rates = [_rate_at_utc(bar_time) for bar_time in bar_times]
+    start = bar_times[0]
+    broker = MT5ReadOnlyBroker(
+        api=api,
+        history_start_utc=start,
+        history_end_utc=now,
+    )
+
+    candles = broker.candles("EURUSD", "H1")
+    closed = last_closed_candles(candles, "H1", now_utc=now)
+
+    assert tuple(candle.time for candle in candles) == bar_times
+    assert closed[-1].time == forming_bar - timedelta(hours=1)
+    assert api.range_requests[0][2:] == (
+        utc_to_broker_wall_time(start),
+        utc_to_broker_wall_time(now),
+    )
+
+
+def test_mt5_bar_times_fail_if_decoded_as_utc() -> None:
+    utc_bar = datetime(2026, 11, 10, 7, tzinfo=UTC)
+    raw_rate = _rate_at_utc(utc_bar)
+    api = FakeMT5()
+    api.rates = [raw_rate]
+    broker = MT5ReadOnlyBroker(
+        api=api,
+        history_start_utc=utc_bar - timedelta(hours=1),
+        history_end_utc=utc_bar + timedelta(hours=1),
+    )
+
+    candle = broker.candles("EURUSD", "H1")[0]
+
+    assert candle.time == utc_bar
+    assert candle.time != datetime.fromtimestamp(int(raw_rate["time"]), tz=UTC)
+
+
+@pytest.mark.parametrize(
+    ("friday_utc", "sunday_utc"),
+    [
+        (
+            datetime(2026, 7, 10, 20, tzinfo=UTC),
+            datetime(2026, 7, 11, 21, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 11, 6, 21, tzinfo=UTC),
+            datetime(2026, 11, 7, 22, tzinfo=UTC),
+        ),
+    ],
+)
+def test_server_wall_week_open_and_close_bars_convert_for_each_season(
+    friday_utc: datetime,
+    sunday_utc: datetime,
+) -> None:
+    api = FakeMT5()
+    api.rates = [_rate_at_utc(friday_utc), _rate_at_utc(sunday_utc)]
+    start = friday_utc - timedelta(hours=1)
+    end = sunday_utc + timedelta(hours=1)
+    broker = MT5ReadOnlyBroker(
+        api=api,
+        history_start_utc=start,
+        history_end_utc=end,
+    )
+
+    candles = broker.candles("EURUSD", "H1")
+
+    assert tuple(candle.time for candle in candles) == (friday_utc, sunday_utc)
 
 
 def test_mt5_adapter_fetches_long_ranges_in_bounded_chunks() -> None:
@@ -127,8 +294,14 @@ def test_mt5_adapter_fetches_long_ranges_in_bounded_chunks() -> None:
     candles = broker.candles("EURUSD", "H1")
 
     assert len(api.range_requests) == 2
-    assert api.range_requests[0][2:] == (start, start + timedelta(days=180))
-    assert api.range_requests[1][2:] == (start + timedelta(days=180), end)
+    assert api.range_requests[0][2:] == (
+        utc_to_broker_wall_time(start),
+        utc_to_broker_wall_time(start + timedelta(days=180)),
+    )
+    assert api.range_requests[1][2:] == (
+        utc_to_broker_wall_time(start + timedelta(days=180)),
+        utc_to_broker_wall_time(end),
+    )
     assert len(candles) == 1
 
 
@@ -168,7 +341,7 @@ def test_mt5_adapter_rejects_naive_history_range() -> None:
         )
 
 
-class FakeLiveMT5API:
+class FakeLiveMT5API(StrictFakeMT5):
     TIMEFRAME_H1 = 60
     TIMEFRAME_H4 = 240
     TRADE_ACTION_DEAL = 1
@@ -202,6 +375,10 @@ class FakeLiveMT5API:
     TRADE_RETCODE_PRICE_OFF = 10021
     TRADE_RETCODE_CONNECTION = 10031
     TRADE_RETCODE_UNKNOWN = 10008
+    DEAL_ENTRY_IN = 0
+    DEAL_ENTRY_OUT = 1
+    DEAL_ENTRY_INOUT = 2
+    DEAL_ENTRY_OUT_BY = 3
 
     def __init__(
         self,
@@ -228,7 +405,7 @@ class FakeLiveMT5API:
         self.positions_result: list[SimpleNamespace] | None = None
         self.history_result: list[SimpleNamespace] | None = None
         self.symbol_select_result = True
-        self.trading_sessions: dict[int, list[tuple[int, int]]] = {}
+        self.symbol_select_requests: list[tuple[str, bool]] = []
         self._tick = SimpleNamespace(
             time=1_767_620_400,
             time_msc=1_767_620_400_250,
@@ -286,19 +463,8 @@ class FakeLiveMT5API:
         return self._info
 
     def symbol_select(self, symbol: str, enable: bool) -> bool:
+        self.symbol_select_requests.append((symbol, enable))
         return self.symbol_select_result
-
-    def symbol_info_session_trade(
-        self,
-        symbol: str,
-        day_of_week: int,
-        session_index: int,
-    ) -> SimpleNamespace | None:
-        day_sessions = self.trading_sessions.get(day_of_week, [])
-        if session_index >= len(day_sessions):
-            return None
-        start, end = day_sessions[session_index]
-        return SimpleNamespace(**{"from": start, "to": end})
 
     def symbol_info_tick(self, symbol: str) -> SimpleNamespace:
         assert symbol == "EURUSD"
@@ -355,7 +521,14 @@ class FakeLiveMT5API:
         self.history_calls.append((date_from, date_to))
         if self.history_result is not None:
             return self.history_result
-        return self.deals
+        start_server_epoch = date_from.timestamp()
+        end_server_epoch = date_to.timestamp() if date_to is not None else None
+        return [
+            deal
+            for deal in self.deals
+            if start_server_epoch <= int(deal.time)
+            and (end_server_epoch is None or int(deal.time) <= end_server_epoch)
+        ]
 
     def order_calc_margin(
         self,
@@ -606,38 +779,17 @@ def test_mt5_broker_reads_terminal_symbol_and_tick() -> None:
     assert terminal.connected
     assert terminal.trade_allowed
     assert symbol.name == "EURUSD"
+    assert api.symbol_select_requests == [("EURUSD", True)]
     assert tick is not None
     assert tick.bid == api._tick.bid
     assert tick.ask == api._tick.ask
     assert candles
 
 
-def test_mt5_broker_converts_symbol_sessions_to_utc_and_splits_midnight() -> None:
-    api = FakeLiveMT5API()
-    api.trading_sessions = {
-        0: [(2 * 60 * 60, 22 * 60 * 60)],
-        1: [(0, 3 * 60 * 60)],
-    }
-    broker = MT5Broker(
-        api=api,
-        server_clock_sanity_provider=lambda: 2,
-    )
-
-    assert broker.symbol_sessions_utc("EURUSD") == (
-        "mon 00:00-20:00",
-        "mon 22:00-23:59",
-        "tue 00:00-01:00",
-    )
-
-
-def test_mt5_broker_rejects_symbols_without_trading_sessions() -> None:
-    broker = MT5Broker(
-        api=FakeLiveMT5API(),
-        server_clock_sanity_provider=lambda: 2,
-    )
-
-    with pytest.raises(RuntimeError, match="no trading sessions"):
-        broker.symbol_sessions_utc("EURUSD")
+def test_fake_mt5_rejects_functions_not_in_the_real_package_api() -> None:
+    unsupported_name = "not_a_real_mt5_function"
+    with pytest.raises(AssertionError, match="Unsupported MetaTrader5 API name"):
+        getattr(FakeLiveMT5API(), unsupported_name)
 
 
 def test_mt5_broker_returns_empty_reads_without_requiring_market_tick() -> None:
@@ -818,7 +970,17 @@ def test_mt5_broker_converts_deal_server_time_using_reported_offset() -> None:
         1_767_620_400 - 2 * 60 * 60,
         tz=UTC,
     )
-    assert api.history_calls == [(datetime(2026, 1, 1, tzinfo=UTC), None)]
+    assert api.history_calls == [(utc_to_broker_wall_time(datetime(2026, 1, 1, tzinfo=UTC)), None)]
+
+
+def test_mt5_history_deal_start_is_converted_using_summer_server_offset() -> None:
+    api = FakeLiveMT5API(hedge_close=False)
+    broker = MT5Broker(api=api, server_clock_sanity_provider=lambda: 3)
+    since_utc = datetime(2026, 7, 1, 12, tzinfo=UTC)
+
+    assert broker.history_deals(since_utc, 712345) == ()
+
+    assert api.history_calls == [(utc_to_broker_wall_time(since_utc), None)]
 
 
 def test_mt5_broker_infers_offset_from_fresh_server_tick() -> None:

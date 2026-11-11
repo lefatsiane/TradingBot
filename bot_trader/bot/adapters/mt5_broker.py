@@ -22,6 +22,7 @@ from bot.core.timeutil import (
     broker_wall_time_to_utc,
     expected_new_york_offset,
     rounded_server_offset_from_tick,
+    utc_to_broker_wall_time,
 )
 from bot.core.types import Candle, Side, SymbolSpec
 
@@ -30,7 +31,6 @@ SERVER_OFFSET_MAX_TICK_AGE_S = 60
 SERVER_OFFSET_SAMPLE_COUNT = 3
 SERVER_OFFSET_MAX_SAMPLE_ATTEMPTS = 30
 SERVER_OFFSET_SAMPLE_INTERVAL_S = 0.1
-_WEEKDAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
 class _SymbolInfo(Protocol):
@@ -106,13 +106,6 @@ class _MT5API(Protocol):
     def symbol_info(self, symbol: str) -> _SymbolInfo | None: ...
 
     def symbol_select(self, symbol: str, enable: bool) -> bool: ...
-
-    def symbol_info_session_trade(
-        self,
-        symbol: str,
-        day_of_week: int,
-        session_index: int,
-    ) -> object | None: ...
 
     def symbol_info_tick(self, symbol: str) -> _TickInfo | None: ...
 
@@ -206,7 +199,7 @@ class MT5ReadOnlyBroker:
         }.get(timeframe)
         if timeframe_constant is None:
             raise ValueError(f"Unsupported MT5 history timeframe: {timeframe}")
-        now = datetime.now(tz=UTC)
+        now = _require_utc(self._clock(), "clock")
         end = self._history_end_utc or now
         start = self._history_start_utc or end - timedelta(days=365 * 6)
         rates_by_time: dict[int, _Rate] = {}
@@ -216,8 +209,8 @@ class MT5ReadOnlyBroker:
             rates = self._api.copy_rates_range(
                 symbol,
                 timeframe_constant,
-                cursor,
-                chunk_end,
+                utc_to_broker_wall_time(cursor),
+                utc_to_broker_wall_time(chunk_end),
             )
             if rates is None:
                 raise RuntimeError(
@@ -249,7 +242,12 @@ class MT5ReadOnlyBroker:
         if info is None:
             return None
         server_epoch = info.time_msc / 1_000 if info.time_msc else info.time
-        return Tick(broker_wall_time_to_utc(server_epoch), info.bid, info.ask)
+        return Tick(
+            broker_wall_time_to_utc(server_epoch),
+            info.bid,
+            info.ask,
+            server_epoch,
+        )
 
     def server_utc_offset_hours(self) -> int:
         return expected_new_york_offset(_require_utc(self._clock(), "clock"))
@@ -369,82 +367,6 @@ class MT5Broker:
             contract_size=float(getattr(info, "trade_contract_size", 100_000.0)),
         )
 
-    def symbol_sessions_utc(self, symbol: str) -> tuple[str, ...]:
-        self.symbol_info(symbol)
-        offset_hours = self.server_utc_offset_hours()
-        windows: list[tuple[int, int, int]] = []
-        for weekday in range(7):
-            session_index = 0
-            while True:
-                session = self._api.symbol_info_session_trade(
-                    symbol,
-                    weekday,
-                    session_index,
-                )
-                if session is None:
-                    break
-                raw_start = getattr(session, "from", None)
-                raw_end = getattr(session, "to", None)
-                if (
-                    isinstance(raw_start, bool)
-                    or not isinstance(raw_start, int)
-                    or isinstance(raw_end, bool)
-                    or not isinstance(raw_end, int)
-                    or raw_start < 0
-                    or raw_start >= 24 * 60 * 60
-                    or raw_end < 0
-                    or raw_end > 24 * 60 * 60
-                ):
-                    raise ValueError(f"Invalid MT5 session times for {symbol}")
-                if raw_end == raw_start:
-                    session_index += 1
-                    continue
-                end_seconds = raw_end
-                if end_seconds < raw_start:
-                    end_seconds += 24 * 60 * 60
-                if end_seconds - raw_start > 24 * 60 * 60:
-                    raise ValueError(f"MT5 session exceeds 24 hours for {symbol}")
-                start_week_seconds = (
-                    weekday * 24 * 60 * 60
-                    + raw_start
-                    - offset_hours * 60 * 60
-                )
-                end_week_seconds = (
-                    weekday * 24 * 60 * 60
-                    + end_seconds
-                    - offset_hours * 60 * 60
-                )
-                while start_week_seconds < end_week_seconds:
-                    day_index = start_week_seconds // (24 * 60 * 60)
-                    segment_end = min(
-                        end_week_seconds,
-                        (day_index + 1) * 24 * 60 * 60,
-                    )
-                    start_minute = (start_week_seconds + 59) // 60
-                    end_minute = segment_end // 60
-                    if end_minute > start_minute:
-                        open_minute = start_minute % (24 * 60)
-                        close_minute = end_minute - day_index * 24 * 60
-                        windows.append(
-                            (
-                                day_index % 7,
-                                open_minute,
-                                min(close_minute, 24 * 60 - 1),
-                            )
-                        )
-                    start_week_seconds = segment_end
-                session_index += 1
-
-        if not windows:
-            raise RuntimeError(f"MT5 returned no trading sessions for {symbol}")
-        windows.sort()
-        return tuple(
-            f"{_WEEKDAY_NAMES[weekday]} "
-            f"{open_minute // 60:02}:{open_minute % 60:02}-"
-            f"{close_minute // 60:02}:{close_minute % 60:02}"
-            for weekday, open_minute, close_minute in windows
-        )
-
     def candles(self, symbol: str, timeframe: str) -> tuple[Candle, ...]:
         read_only = MT5ReadOnlyBroker(api=self._api)
         return read_only.candles(symbol, timeframe)
@@ -462,6 +384,7 @@ class MT5Broker:
             broker_wall_time_to_utc(server_epoch),
             float(info.bid),
             float(info.ask),
+            server_epoch,
         )
 
     def server_utc_offset_hours(self) -> int:
@@ -594,7 +517,7 @@ class MT5Broker:
         return tuple(positions)
 
     def history_deals(self, since_utc: datetime, magic_number: int) -> tuple[BrokerDeal, ...]:
-        raw = self._api.history_deals_get(since_utc)
+        raw = self._api.history_deals_get(utc_to_broker_wall_time(since_utc))
         if raw is None:
             raise RuntimeError(f"MetaTrader 5 history_deals_get failed: {self._api.last_error()}")
         if not raw:

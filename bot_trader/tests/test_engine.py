@@ -544,7 +544,6 @@ def test_default_context_factory_reads_broker_and_store_risk_state(tmp_path) -> 
         {"EURUSD": SPEC},
         {"EURUSD": Tick(NOW, 1.1, 1.1001)},
         clock=clock,
-        session_hours={"EURUSD": ("mon 00:00-21:55", "fri 00:00-21:55")},
     )
     store = StateStore(tmp_path / "context-factory.db")
     gateway = BrokerGateway(broker, max_retries=0)
@@ -734,7 +733,6 @@ def test_unexpected_entry_failure_halts_entries_but_keeps_management_available(
         {"EURUSD": SPEC},
         {"EURUSD": Tick(NOW, 1.1, 1.1001)},
         clock=clock,
-        session_hours={"EURUSD": ("mon 00:00-21:55", "fri 00:00-21:55")},
     )
     store = StateStore(tmp_path / "entry-error.db")
     gateway = BrokerGateway(broker, max_retries=0)
@@ -1057,7 +1055,6 @@ def test_monthly_loss_limit_flattens_positions_in_management_lane(tmp_path) -> N
         {"EURUSD": SPEC},
         {"EURUSD": Tick(NOW, 1.1, 1.1001)},
         clock=clock,
-        session_hours={"EURUSD": ("mon 00:00-21:55", "fri 00:00-21:55")},
     )
     store = StateStore(tmp_path / "management.db")
     gateway = BrokerGateway(broker, max_retries=0)
@@ -1133,7 +1130,6 @@ def test_daily_loss_limit_keeps_protective_stop_and_position_open(tmp_path) -> N
         {"EURUSD": SPEC},
         {"EURUSD": Tick(NOW, 1.1, 1.1001)},
         clock=clock,
-        session_hours={"EURUSD": ("mon 00:00-21:55", "fri 00:00-21:55")},
     )
     store = StateStore(tmp_path / "daily.db")
     gateway = BrokerGateway(broker, max_retries=0)
@@ -1211,7 +1207,6 @@ def test_management_lane_flattens_before_configured_friday_close(
         {"EURUSD": SPEC},
         {"EURUSD": Tick(now, 1.1, 1.1001)},
         clock=clock,
-        session_hours={"EURUSD": ("mon 00:00-21:55", "fri 00:00-21:55")},
     )
     store = StateStore(tmp_path / "friday.db")
     gateway = BrokerGateway(broker, max_retries=0)
@@ -1312,7 +1307,6 @@ def test_management_lane_closes_strategy_b_after_24_closed_h1_candles(
         {"EURUSD": Tick(NOW, 1.1, 1.1001)},
         clock=clock,
         candle_data={("EURUSD", "H1"): bars},
-        session_hours={"EURUSD": ("mon 00:00-21:55", "fri 00:00-21:55")},
     )
     store = StateStore(tmp_path / "strategy-b-time-stop.db")
     gateway = BrokerGateway(broker, max_retries=0)
@@ -1383,7 +1377,6 @@ def test_management_lane_applies_close_all_without_clearing_stop_new_and_records
         {"EURUSD": SPEC},
         {"EURUSD": Tick(NOW, 1.1, 1.1001)},
         clock=clock,
-        session_hours={"EURUSD": ("mon 00:00-21:55", "fri 00:00-21:55")},
     )
     store = StateStore(tmp_path / "close-all.db")
     gateway = BrokerGateway(broker, max_retries=0)
@@ -1611,7 +1604,6 @@ def test_engine_start_runs_guards_recovery_and_one_management_pass(tmp_path) -> 
                 Candle(NOW - timedelta(hours=4), 1.1, 1.1002, 1.0998, 1.1001),
             ),
         },
-        session_hours={"EURUSD": ("mon 00:00-21:55", "fri 00:00-21:55")},
     )
     store = StateStore(tmp_path / "startup.db")
     gateway = BrokerGateway(broker, max_retries=0)
@@ -1800,15 +1792,6 @@ def test_engine_simulated_week_covers_gates_limits_flatten_and_restart(
         {"EURUSD": Tick(NOW, 1.1, 1.1001)},
         clock=clock,
         server_offset_hours=3,
-        session_hours={
-            "EURUSD": (
-                "mon 00:00-21:55",
-                "tue 00:00-21:55",
-                "wed 00:00-21:55",
-                "thu 00:00-21:55",
-                "fri 00:00-21:55",
-            )
-        },
         candle_data={
             ("EURUSD", "H1"): (
                 Candle(NOW - timedelta(hours=1), 1.1, 1.1002, 1.0998, 1.1001),

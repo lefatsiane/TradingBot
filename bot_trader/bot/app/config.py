@@ -112,12 +112,56 @@ _DAY_INDEX = {
     "sat": 5,
     "sun": 6,
 }
+_DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _TIME_UTC = r"(?:[01]\d|2[0-3]):[0-5]\d"
 _HOURS_UTC_RE = re.compile(
     rf"^(mon|tue|wed|thu|fri|sat|sun)\s+({_TIME_UTC})-({_TIME_UTC}|24:00)$",
     re.IGNORECASE,
 )
+_SERVER_WINDOW_RE = re.compile(rf"^({_TIME_UTC})-({_TIME_UTC}|24:00)$")
 ScheduleSeason = Literal["US winter", "US summer"]
+
+
+class BrokerSessionHoursServerTime(StrictModel):
+    sun: tuple[str, ...] = ()
+    mon: tuple[str, ...] = ("00:01-23:59",)
+    tue: tuple[str, ...] = ("00:01-23:59",)
+    wed: tuple[str, ...] = ("00:01-23:59",)
+    thu: tuple[str, ...] = ("00:01-23:59",)
+    fri: tuple[str, ...] = ("00:01-23:57",)
+    sat: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_server_hours(self) -> BrokerSessionHoursServerTime:
+        for day_name, windows in self.model_dump().items():
+            parsed: list[tuple[int, int]] = []
+            for window in windows:
+                match = _SERVER_WINDOW_RE.fullmatch(window.strip())
+                if match is None:
+                    raise ValueError(
+                        f"Invalid {day_name} server session {window!r}; "
+                        "expected '00:01-23:59'"
+                    )
+                start_text, end_text = match.groups()
+                start = _minutes_after_midnight(start_text)
+                end = 24 * 60 if end_text == "24:00" else _minutes_after_midnight(end_text)
+                if start >= end:
+                    raise ValueError(
+                        f"Invalid {day_name} server session {window!r}; "
+                        "end time must be after start time"
+                    )
+                if any(
+                    start < previous_end and previous_start < end
+                    for previous_start, previous_end in parsed
+                ):
+                    raise ValueError(f"Overlapping {day_name} server sessions")
+                parsed.append((start, end))
+        return self
+
+
+def _minutes_after_midnight(value: str) -> int:
+    parsed = time.fromisoformat(value)
+    return parsed.hour * 60 + parsed.minute
 
 
 def parse_sessions(hours: tuple[str, ...]) -> tuple[SessionWindow, ...]:
@@ -142,6 +186,50 @@ def parse_sessions(hours: tuple[str, ...]) -> tuple[SessionWindow, ...]:
             )
         )
     return tuple(sessions)
+
+
+def broker_session_hours_to_utc(
+    server_hours: BrokerSessionHoursServerTime,
+    at_utc: datetime,
+) -> tuple[str, ...]:
+    if at_utc.tzinfo is None or at_utc.utcoffset() != UTC.utcoffset(at_utc):
+        raise ValueError("at_utc must be timezone-aware UTC")
+    offset_minutes = expected_new_york_offset(at_utc) * 60
+    windows: list[tuple[int, int, str]] = []
+    for weekday, day_name in enumerate(_DAY_NAMES):
+        for raw_window in getattr(server_hours, day_name):
+            match = _SERVER_WINDOW_RE.fullmatch(raw_window.strip())
+            if match is None:
+                raise ValueError(f"Invalid {day_name} server session {raw_window!r}")
+            start_text, end_text = match.groups()
+            start = _minutes_after_midnight(start_text)
+            end = 24 * 60 if end_text == "24:00" else _minutes_after_midnight(end_text)
+            start_week_minute = weekday * 24 * 60 + start - offset_minutes
+            end_week_minute = start_week_minute + end - start
+            cursor = start_week_minute
+            while cursor < end_week_minute:
+                absolute_day = cursor // (24 * 60)
+                weekday_utc = absolute_day % 7
+                day_start = absolute_day * 24 * 60
+                segment_end = min(end_week_minute, day_start + 24 * 60)
+                opens = cursor - day_start
+                closes = segment_end - day_start
+                start_text_utc = f"{opens // 60:02d}:{opens % 60:02d}"
+                end_text_utc = (
+                    "24:00"
+                    if closes == 24 * 60
+                    else f"{closes // 60:02d}:{closes % 60:02d}"
+                )
+                windows.append(
+                    (
+                        weekday_utc,
+                        opens,
+                        f"{_DAY_NAMES[weekday_utc]} {start_text_utc}-{end_text_utc}",
+                    )
+                )
+                cursor = segment_end
+    windows.sort(key=lambda item: ((item[0] + 1) % 7, item[1]))
+    return tuple(window for _, _, window in windows)
 
 
 def session_windows_overlap(sessions: Iterable[SessionWindow]) -> bool:
@@ -414,6 +502,9 @@ class Settings(StrictModel):
     gates: GateSettings
     execution: ExecutionSettings
     control: ControlSettings
+    broker_session_hours_server_time: BrokerSessionHoursServerTime = Field(
+        default_factory=BrokerSessionHoursServerTime
+    )
     symbols: dict[str, SymbolSettings] = Field(min_length=1)
     strategy_a: StrategyASettings
     strategy_b: StrategyBSettings
