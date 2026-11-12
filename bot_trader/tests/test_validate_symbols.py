@@ -615,7 +615,10 @@ def test_validate_symbols_requires_review_confirmation_before_writing(
     assert validate_symbols_tool.main(["--write"]) == 0
 
     assert writes == []
-    assert "No settings were written." in capsys.readouterr().out
+    assert (
+        "--write not performed: report confirmation was not provided."
+        in capsys.readouterr().out
+    )
     assert broker.shutdown_called
 
 
@@ -683,7 +686,7 @@ def test_write_includes_pass_and_warn_but_excludes_fail_and_disabled(
     assert "USDJPY  yes      FAIL" in output
     assert "XAUUSD  no       DISABLED" in output
     assert "GBPUSD: 2026-06-29 06:00 UTC" in output
-    assert "Changed symbols: EURUSD, GBPUSD" in output
+    assert "--write wrote symbols EURUSD, GBPUSD to " in output
     assert 'hours_utc = ["sun 22:01-24:00"]' in output
     assert 'hours_utc_season = "US winter"' in output
     assert "disabled-symbol diagnostic" not in output.split("FAILURES", maxsplit=1)[1]
@@ -706,10 +709,173 @@ def test_write_is_refused_for_non_demo_account(monkeypatch, capsys) -> None:
     assert validate_symbols_tool.main(["--write"]) == 1
 
     output = capsys.readouterr().out
-    assert "Refusing --write: the connected MT5 account is not a demo account." in output
+    assert (
+        "--write not performed: the connected account is not a demo account."
+        in output
+    )
     assert writes == []
     assert "FAILURES" in output
     assert broker.shutdown_called
+
+
+def _freeze_validator_clock(monkeypatch, at_utc: datetime) -> None:
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return at_utc.astimezone(tz) if tz is not None else at_utc.replace(tzinfo=None)
+
+    monkeypatch.setattr(validate_symbols_tool, "datetime", FrozenDateTime)
+
+
+def test_write_reports_no_eligible_symbols(monkeypatch, capsys) -> None:
+    _prepare_validation_cli(monkeypatch, ("EURUSD", "XAUUSD"))
+
+    def report_symbol(_broker, symbol, symbol_settings, **kwargs):
+        if symbol_settings.enabled:
+            return SymbolValidationReport(
+                symbol, True, False, 4_000, 1, 1, 1, 10,
+                (), None, ("live validation failed",),
+            )
+        return SymbolValidationReport(
+            symbol, False, False, 4_000, 1, 1, 1, 100,
+            (), None, ("disabled",),
+        )
+
+    monkeypatch.setattr(validate_symbols_tool, "validate_symbol", report_symbol)
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda _prompt: pytest.fail("must not request confirmation without schedules"),
+    )
+
+    assert validate_symbols_tool.main(["--write"]) == 1
+
+    output = capsys.readouterr().out
+    assert (
+        "--write not performed: no enabled PASS or WARN symbol has a schedule "
+        "to write (FAIL symbols: EURUSD; DISABLED symbols excluded: XAUUSD)."
+    ) in output
+
+
+@pytest.mark.parametrize(
+    ("exception", "expected"),
+    [
+        (RuntimeError("EURUSD time_msc did not advance"), "no fresh tick"),
+        (RuntimeError("EURUSD sanity tick is stale"), "tick too stale"),
+        (RuntimeError("MT5 server clock reports UTC+3, expects UTC+2"), "offset mismatch"),
+    ],
+)
+def test_offset_failure_reason_is_actionable(exception, expected) -> None:
+    assert validate_symbols_tool._offset_failure_reason(exception) == expected
+
+
+@pytest.mark.parametrize(
+    ("at_utc", "period", "exit_code", "message"),
+    [
+        (
+            datetime(2026, 11, 10, 22, 5, tzinfo=UTC),
+            "rollover",
+            validate_symbols_tool.EXIT_ROLLOVER_WINDOW,
+            "rollover window: spread and offset not evaluated, rerun later",
+        ),
+        (
+            datetime(2026, 11, 14, 12, 0, tzinfo=UTC),
+            "weekend",
+            validate_symbols_tool.EXIT_WEEKEND_CLOSED,
+            "weekend: spread and offset not evaluated, rerun when market opens",
+        ),
+        (
+            datetime(2026, 7, 7, 12, 0, tzinfo=UTC),
+            "market_closed",
+            validate_symbols_tool.EXIT_MARKET_CLOSED,
+            "market closed: spread and offset not evaluated, rerun when market opens",
+        ),
+    ],
+)
+def test_write_skips_market_checks_during_rollover_and_weekend(
+    monkeypatch,
+    capsys,
+    at_utc,
+    period,
+    exit_code,
+    message,
+) -> None:
+    broker = _prepare_validation_cli(monkeypatch, ("EURUSD",))
+    settings, _ = load_settings(Path(__file__).parents[1] / "settings.toml")
+    if period == "market_closed":
+        settings = settings.model_copy(
+            update={
+                "account": settings.account.model_copy(
+                    update={"expected_server": "Demo"}
+                ),
+                "symbols": {"EURUSD": settings.symbols["EURUSD"]},
+                "broker_session_hours_server_time": BrokerSessionHoursServerTime(
+                    mon=(),
+                    tue=(),
+                    wed=(),
+                    thu=(),
+                    fri=(),
+                    sat=(),
+                    sun=(),
+                )
+            }
+        )
+        monkeypatch.setattr(
+            validate_symbols_tool,
+            "load_settings",
+            lambda _path: (settings, "settings-hash"),
+        )
+    _freeze_validator_clock(monkeypatch, at_utc)
+    monkeypatch.setattr(
+        broker,
+        "server_utc_offset_hours",
+        lambda: pytest.fail("offset must not be evaluated while market is closed"),
+    )
+    monkeypatch.setattr(
+        validate_symbols_tool,
+        "sample_live_spread",
+        lambda *args: pytest.fail("spread must not be sampled while market is closed"),
+    )
+    monkeypatch.setattr(
+        validate_symbols_tool,
+        "validate_symbol",
+        lambda *args, **kwargs: pytest.fail("symbol checks must be skipped"),
+    )
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda _prompt: pytest.fail("must not request confirmation while market is closed"),
+    )
+
+    assert validate_symbols_tool.main(["--write"]) == exit_code
+
+    output = capsys.readouterr().out
+    assert message in output
+    assert f"--write not performed: {message}." in output
+    assert "FAILURES\nNone" in output
+    assert period == validate_symbols_tool._validation_period(settings, at_utc)
+
+
+def test_market_closed_period_has_distinct_status(monkeypatch) -> None:
+    settings, _ = load_settings(Path(__file__).parents[1] / "settings.toml")
+    closed_hours = BrokerSessionHoursServerTime(
+        mon=(),
+        tue=(),
+        wed=(),
+        thu=(),
+        fri=(),
+        sat=(),
+        sun=(),
+    )
+    settings = settings.model_copy(
+        update={"broker_session_hours_server_time": closed_hours}
+    )
+
+    assert (
+        validate_symbols_tool._validation_period(
+            settings,
+            datetime(2026, 7, 7, 12, tzinfo=UTC),
+        )
+        == "market_closed"
+    )
 
 
 def test_disabled_symbol_data_is_reported_but_not_added_to_failures(

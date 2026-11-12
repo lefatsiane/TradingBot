@@ -1,0 +1,15 @@
+# DRAFT rows are never accepted; populate both approval fields only after owner review.
+symbol,timeframe,start_utc,end_utc,missing_candles,reason,approved_by,approved_on
+EURUSD,H1,2026-03-31T21:00:00+00:00,2026-03-31T22:00:00+00:00,1,reported single missing candle,Lefa,2026-11-12
+GBPUSD,H1,2026-03-31T21:00:00+00:00,2026-03-31T22:00:00+00:00,1,reported single missing candle,Lefa,2026-11-12
+NZDUSD,H1,2026-03-31T21:00:00+00:00,2026-03-31T22:00:00+00:00,1,reported single missing candle,Lefa,2026-11-12
+USDCHF,H1,2026-03-31T21:00:00+00:00,2026-03-31T22:00:00+00:00,1,reported single missing candle,Lefa,2026-11-12
+USDJPY,H1,2026-03-31T21:00:00+00:00,2026-03-31T22:00:00+00:00,1,reported single missing candle,Lefa,2026-11-12
+AUDUSD,H1,2026-06-29T06:00:00+00:00,2026-06-29T07:00:00+00:00,1,reported single missing candle,Lefa,2026-11-12
+GBPUSD,H1,2026-06-29T06:00:00+00:00,2026-06-29T07:00:00+00:00,1,reported single missing candle,Lefa,2026-11-12
+NZDUSD,H1,2026-06-29T06:00:00+00:00,2026-06-29T07:00:00+00:00,1,reported single missing candle,Lefa,2026-11-12
+USDCHF,H1,2026-06-29T06:00:00+00:00,2026-06-29T07:00:00+00:00,1,reported single missing candle,Lefa,2026-11-12
+USDJPY,H1,2026-06-29T06:00:00+00:00,2026-06-29T07:00:00+00:00,1,reported single missing candle,Lefa,2026-11-12
+NZDUSD,H1,2022-11-11T21:00:00+00:00,2022-11-11T22:00:00+00:00,1,reported single missing candle,Lefa,2026-11-12
+NZDUSD,H1,2023-03-12T21:00:00+00:00,2023-03-12T22:00:00+00:00,1,reported single missing candle,Lefa,2026-11-12
+NZDUSD,H1,2023-03-19T21:00:00+00:00,2023-03-19T22:00:00+00:00,1,reported single missing candle,Lefa,2026-11-12

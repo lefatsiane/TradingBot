@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -14,10 +14,58 @@ from bot.app.config import load_runtime_secrets, load_settings, schedule_season_
 from bot.app.symbol_validation import (
     SymbolValidationReport,
     TickFreshnessDiagnostic,
+    _market_is_open,
     sample_live_spread,
     validate_symbol,
     write_hours_utc,
 )
+from bot.core.timeutil import broker_wall_time_to_utc, expected_new_york_offset
+
+EXIT_ROLLOVER_WINDOW = 3
+EXIT_WEEKEND_CLOSED = 4
+EXIT_MARKET_CLOSED = 5
+
+
+def _validation_period(settings, now_utc: datetime) -> str | None:
+    timing = settings.timing
+    server_date = (
+        now_utc + timedelta(hours=expected_new_york_offset(now_utc))
+    ).date()
+    boundaries = (
+        broker_wall_time_to_utc(
+            datetime.combine(server_date + timedelta(days=day_delta), time.min)
+            .replace(tzinfo=UTC)
+            .timestamp()
+        )
+        for day_delta in (-1, 0, 1)
+    )
+    for boundary in boundaries:
+        if (
+            boundary - timedelta(minutes=timing.rollover_block_before_min)
+            <= now_utc
+            <= boundary + timedelta(minutes=timing.rollover_block_after_min)
+        ):
+            return "rollover"
+    if (now_utc + timedelta(hours=expected_new_york_offset(now_utc))).weekday() >= 5:
+        return "weekend"
+    if not _market_is_open(now_utc, settings.broker_session_hours_server_time):
+        return "market_closed"
+    return None
+
+
+def _offset_failure_reason(error: Exception) -> str:
+    message = str(error).casefold()
+    if "stale" in message or "too old" in message:
+        return "tick too stale"
+    if (
+        "did not advance" in message
+        or "no fresh tick" in message
+        or "no valid time_msc" in message
+    ):
+        return "no fresh tick"
+    if "offset" in message or "reports utc" in message or "expects utc" in message:
+        return "offset mismatch"
+    return f"offset verification unavailable ({type(error).__name__})"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,6 +84,11 @@ def main(argv: list[str] | None = None) -> int:
         settings, _ = load_settings(settings_path)
     except (OSError, ValueError) as error:
         print(f"Configuration error ({type(error).__name__}).", file=sys.stderr)
+        if args.write:
+            print(
+                f"--write not performed: settings could not be loaded "
+                f"({type(error).__name__})."
+            )
         return 2
 
     broker = MT5Broker()
@@ -45,6 +98,9 @@ def main(argv: list[str] | None = None) -> int:
     failures: list[str] = []
     secrets = None
     offset_message = "Broker UTC offset: not checked"
+    now_utc = datetime.now(tz=UTC)
+    validation_period: str | None = None
+    write_outcome: str | None = None
     try:
         secrets = load_runtime_secrets()
         if secrets.mt5_login is None:
@@ -69,19 +125,31 @@ def main(argv: list[str] | None = None) -> int:
         if account_failures:
             failures.extend(account_failures)
         else:
-            now_utc = datetime.now(tz=UTC)
-            try:
-                offset = broker.server_utc_offset_hours()
+            validation_period = _validation_period(settings, now_utc)
+            if validation_period == "rollover":
                 offset_message = (
-                    f"Broker UTC offset: UTC{offset:+d}, verified against fresh EURUSD ticks"
+                    "rollover window: spread and offset not evaluated, rerun later"
                 )
-            except (ConnectionError, OSError, RuntimeError, ValueError) as error:
-                failures.append(
-                    f"Broker UTC offset check failed ({type(error).__name__})"
+            elif validation_period == "weekend":
+                offset_message = (
+                    "weekend: spread and offset not evaluated, rerun when market opens"
                 )
-                offset_message = failures[-1]
+            elif validation_period == "market_closed":
+                offset_message = (
+                    "market closed: spread and offset not evaluated, rerun when market opens"
+                )
+            else:
+                try:
+                    offset = broker.server_utc_offset_hours()
+                    offset_message = (
+                        f"Broker UTC offset: UTC{offset:+d}, verified against fresh EURUSD ticks"
+                    )
+                except (ConnectionError, OSError, RuntimeError, ValueError) as error:
+                    reason = _offset_failure_reason(error)
+                    failures.append(f"Broker UTC offset check failed: {reason}")
+                    offset_message = failures[-1]
 
-        if not account_failures:
+        if not account_failures and validation_period is None:
             for symbol, symbol_settings in settings.symbols.items():
                 try:
                     live_spread_samples: tuple[float, ...] | None = None
@@ -137,6 +205,11 @@ def main(argv: list[str] | None = None) -> int:
                     )
     except (ConnectionError, OSError, PermissionError, RuntimeError, ValueError) as error:
         print(f"Symbol validation could not run ({type(error).__name__}).", file=sys.stderr)
+        if args.write:
+            print(
+                f"--write not performed: MT5 connection/account validation failed "
+                f"({type(error).__name__})."
+            )
         return 2
     finally:
         if connected:
@@ -161,50 +234,88 @@ def main(argv: list[str] | None = None) -> int:
         )
     print(offset_message)
     _print_reports(reports, sensitive_values)
-    if args.write and not account_is_demo:
-        print("Refusing --write: the connected MT5 account is not a demo account.")
-    elif args.write and not failures:
-        passing_schedules = {
-            report.symbol: report.suggested_hours_utc
-            for report in reports
-            if (
-                report.enabled
-                and report.passed
-                and report.suggested_hours_utc
+    if args.write:
+        if validation_period is not None:
+            write_outcome = f"--write not performed: {offset_message}."
+        elif not account_is_demo:
+            write_outcome = (
+                "--write not performed: the connected account is not a demo account."
             )
-        }
-        if passing_schedules:
-            try:
-                confirmation = input(
-                    "Review the report above. Type APPLY to update settings.toml: "
+        elif failures:
+            write_outcome = (
+                "--write not performed: global validation failed: "
+                + "; ".join(failures)
+                + "."
+            )
+        else:
+            passing_schedules = {
+                report.symbol: report.suggested_hours_utc
+                for report in reports
+                if (
+                    report.enabled
+                    and report.passed
+                    and report.suggested_hours_utc
                 )
-            except EOFError:
-                confirmation = ""
-            if confirmation == "APPLY":
+            }
+            if passing_schedules:
                 try:
-                    changed_lines = write_hours_utc(
-                        settings_path,
-                        passing_schedules,
-                        schedule_season_for_utc(now_utc),
+                    confirmation = input(
+                        "Review the report above. Type APPLY to update settings.toml: "
                     )
-                except (OSError, ValueError) as error:
-                    failures.append(
-                        f"Could not write UTC schedules ({type(error).__name__})"
+                except EOFError:
+                    confirmation = ""
+                if confirmation != "APPLY":
+                    write_outcome = (
+                        "--write not performed: report confirmation was not provided."
                     )
                 else:
-                    if changed_lines:
-                        changed_symbols = ", ".join(changed_lines)
-                        print(f"Changed symbols: {changed_symbols}")
-                        for symbol, written_lines in changed_lines.items():
-                            print(f"settings.toml [symbols.{symbol}]")
-                            for line in written_lines:
-                                print(line)
+                    try:
+                        changed_lines = write_hours_utc(
+                            settings_path,
+                            passing_schedules,
+                            schedule_season_for_utc(now_utc),
+                        )
+                    except (OSError, ValueError) as error:
+                        write_outcome = (
+                            "--write not performed: settings write failed "
+                            f"({type(error).__name__})."
+                        )
                     else:
-                        print("No settings changes were needed.")
+                        if changed_lines:
+                            changed_symbols = ", ".join(changed_lines)
+                            for symbol, written_lines in changed_lines.items():
+                                print(f"settings.toml [symbols.{symbol}]")
+                                for line in written_lines:
+                                    print(line)
+                            write_outcome = (
+                                f"--write wrote symbols {changed_symbols} "
+                                f"to {settings_path}."
+                            )
+                        else:
+                            write_outcome = (
+                                "--write not performed: settings already contain "
+                                "the requested schedules."
+                            )
             else:
-                print("No settings were written.")
-        else:
-            print("No passing enabled-symbol schedules are available to write.")
+                failed_symbols = [
+                    report.symbol
+                    for report in reports
+                    if report.enabled and not report.passed
+                ]
+                disabled_symbols = [
+                    report.symbol for report in reports if not report.enabled
+                ]
+                reasons = []
+                if failed_symbols:
+                    reasons.append("FAIL symbols: " + ", ".join(failed_symbols))
+                if disabled_symbols:
+                    reasons.append("DISABLED symbols excluded: " + ", ".join(disabled_symbols))
+                write_outcome = (
+                    "--write not performed: no enabled PASS or WARN symbol has a "
+                    "schedule to write"
+                    + (f" ({'; '.join(reasons)})" if reasons else "")
+                    + "."
+                )
 
     enabled_failures = [
         report for report in reports if report.enabled and not report.passed
@@ -226,6 +337,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"- {report.symbol}: {_redact(issue, sensitive_values)}")
     else:
         print("None")
+    if args.write and write_outcome is not None:
+        print(write_outcome)
+    if validation_period == "rollover":
+        return EXIT_ROLLOVER_WINDOW
+    if validation_period == "weekend":
+        return EXIT_WEEKEND_CLOSED
+    if validation_period == "market_closed":
+        return EXIT_MARKET_CLOSED
     if enabled_failures:
         return 1
     return 1 if failures else 0

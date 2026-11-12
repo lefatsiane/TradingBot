@@ -38,6 +38,7 @@ def run_random_entry_control(
     cost_multiplier: float = 1.0,
     runs: int = DEFAULT_RANDOM_RUNS,
     seed: int = 0,
+    accepted_gaps: tuple[dict[str, object], ...] = (),
 ) -> Path:
     if not strategies or any(strategy not in ("a", "b") for strategy in strategies):
         raise ValueError("strategies must contain 'a', 'b', or both")
@@ -64,6 +65,7 @@ def run_random_entry_control(
             code_version=code_version,
             settings_version=settings_version,
             cost_multiplier=cost_multiplier,
+            accepted_gaps=accepted_gaps,
         )
         targets = Counter(trade.symbol for trade in baseline.trades)
         if not targets:
@@ -136,6 +138,7 @@ def run_random_entry_control(
                     code_version=code_version,
                     settings_version=settings_version,
                     cost_multiplier=cost_multiplier,
+                    accepted_gaps=accepted_gaps,
                     random_entry_schedule=schedule,
                     random_entry_targets=targets,
                 )
@@ -216,6 +219,7 @@ def run_random_entry_control(
             "requested_runs": runs,
             "acceptance_run_count_met": runs == DEFAULT_RANDOM_RUNS,
             "seed": seed,
+            "accepted_history_gaps": list(accepted_gaps),
             "runs": run_rows,
         }
 
@@ -228,6 +232,7 @@ def run_random_entry_control(
         "cost_multiplier": cost_multiplier,
         "holdout_final": False,
         "requested_runs_per_strategy": runs,
+        "accepted_history_gaps": list(accepted_gaps),
         "strategies": strategy_results,
     }
     destination = (

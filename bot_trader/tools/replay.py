@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from bot.adapters.broker import SymbolSpec
 from bot.app.config import Settings, load_settings
 from bot.app.data import Candle, DataQualityError, Timeframe, read_history_cache
+from bot.app.history_gaps import load_holiday_windows, load_known_gaps
 from bot.app.replay_runner import (
     claim_final_holdout_lock,
     run_replay,
@@ -94,6 +95,21 @@ def main() -> None:
         if args.reports_dir
         else settings_path.parent / "data" / "reports"
     )
+    try:
+        owner_approved_gaps = tuple(
+            gap.as_dict()
+            for gap in load_known_gaps(
+                settings_path.parent / "config" / "known_gaps.csv"
+            )
+        )
+        owner_approved_holidays = tuple(
+            holiday.as_dict()
+            for holiday in load_holiday_windows(
+                settings_path.parent / "config" / "broker_holidays.csv"
+            )
+        )
+    except (OSError, ValueError) as error:
+        parser.error(f"Could not load history approvals ({type(error).__name__}): {error}")
     timeframes: tuple[Timeframe, ...] = (
         settings.strategy_a.timeframes
         if args.strategy == "a"
@@ -103,12 +119,19 @@ def main() -> None:
     )
     histories = {}
     specs = {}
+    accepted_gaps: list[dict[str, object]] = []
     try:
         for symbol, symbol_settings in settings.symbols.items():
             if not symbol_settings.enabled:
                 continue
             for timeframe in timeframes:
-                candles, manifest = read_history_cache(data_dir, symbol, timeframe)
+                candles, manifest = read_history_cache(
+                    data_dir,
+                    symbol,
+                    timeframe,
+                    owner_approved_gaps=owner_approved_gaps,
+                    owner_approved_holidays=owner_approved_holidays,
+                )
                 if manifest.symbol_spec is None:
                     parser.error(
                         f"{symbol} {timeframe} manifest has no symbol specification; "
@@ -118,6 +141,7 @@ def main() -> None:
                 if previous_spec != manifest.symbol_spec:
                     parser.error(f"{symbol} manifests disagree on symbol specification.")
                 histories[(symbol, timeframe)] = candles
+                accepted_gaps.extend(manifest.accepted_gaps)
     except DataQualityError as error:
         parser.error(str(error))
 
@@ -145,6 +169,7 @@ def main() -> None:
                 cost_multiplier=args.cost_multiplier,
                 runs=args.random_runs,
                 seed=args.random_seed,
+                accepted_gaps=tuple(accepted_gaps),
             )
             print(f"Saved random-entry control: {report_path}")
             return
@@ -166,6 +191,7 @@ def main() -> None:
                 code_version=code_version,
                 settings_version=settings_version,
                 cost_multiplier=args.cost_multiplier,
+                accepted_gaps=tuple(accepted_gaps),
             )
             print(f"Saved sensitivity results: {sensitivity_path}")
             return
@@ -188,6 +214,7 @@ def main() -> None:
             code_version=code_version,
             settings_version=settings_version,
             cost_multiplier=args.cost_multiplier,
+            accepted_gaps=tuple(accepted_gaps),
         )
     except (DataQualityError, ValueError, RuntimeError) as error:
         parser.error(str(error))
@@ -218,6 +245,7 @@ def _run_sensitivity(
     code_version: str,
     settings_version: str,
     cost_multiplier: float,
+    accepted_gaps: tuple[dict[str, object], ...] = (),
 ) -> Path:
     rows: list[dict[str, object]] = []
     for strategy in strategies:
@@ -281,6 +309,7 @@ def _run_sensitivity(
                         settings_version=settings_version,
                         cost_multiplier=cost_multiplier,
                         strategy_a_params=candidate,
+                        accepted_gaps=accepted_gaps,
                     )
                 else:
                     result = run_replay(
@@ -296,6 +325,7 @@ def _run_sensitivity(
                         settings_version=settings_version,
                         cost_multiplier=cost_multiplier,
                         strategy_b_params=candidate,
+                        accepted_gaps=accepted_gaps,
                     )
                 record_variant(
                     report_root / "variants.json",

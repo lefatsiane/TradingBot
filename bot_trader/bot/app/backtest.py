@@ -11,7 +11,13 @@ from bot.adapters.broker import (
     Tick,
 )
 from bot.adapters.sim_broker import SimBroker, SimCosts
-from bot.app.data import DataQualityError, Timeframe, last_closed_candles, validate_candles
+from bot.app.data import (
+    DataQualityError,
+    Timeframe,
+    accepted_gap_times,
+    last_closed_candles,
+    validate_candles,
+)
 from bot.core.clock import SimClock
 from bot.core.replay import ReplayPosition, ReplaySettings, ReplayTrade
 from bot.core.risk import RiskLimits, evaluate_entry, evaluate_loss_limits
@@ -46,6 +52,7 @@ class BacktestResult:
     skipped_risk: int
     excluded_recent_bars: int
     history_gap_count: int
+    accepted_gaps: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,9 +74,16 @@ def select_backtest_history(
     *,
     now_utc: datetime,
     final: bool = False,
+    accepted_gaps: tuple[dict[str, object], ...] = (),
 ) -> tuple[tuple[Candle, ...], int]:
     """Keep recent out-of-sample bars out unless explicitly running --final."""
-    closed = last_closed_candles(candles, timeframe, now_utc=now_utc)
+    allowed_gap_times = accepted_gap_times(accepted_gaps, timeframe)
+    closed = last_closed_candles(
+        candles,
+        timeframe,
+        now_utc=now_utc,
+        allowed_gap_times=allowed_gap_times,
+    )
     if final:
         return closed, 0
     cutoff = _one_year_before(_require_utc(now_utc, "now_utc"))
@@ -80,7 +94,11 @@ def select_backtest_history(
             "No eligible backtest candles remain after excluding the most recent 12 months; "
             "use --final only for the final evaluation run."
         )
-    validate_candles(selected, timeframe)
+    validate_candles(
+        selected,
+        timeframe,
+        allowed_gap_times=allowed_gap_times,
+    )
     return selected, excluded
 
 
@@ -97,6 +115,7 @@ def run_strategy_a_backtest(
     costs: SimCosts | None = None,
     final: bool = False,
     history_gap_count: int = 0,
+    accepted_gaps: tuple[dict[str, object], ...] = (),
 ) -> BacktestResult:
     """Run closed-bar Strategy A through SimBroker with risk and costs enabled."""
     settings = settings or ReplaySettings()
@@ -110,6 +129,7 @@ def run_strategy_a_backtest(
         timeframe,
         now_utc=now_utc,
         final=final,
+        accepted_gaps=accepted_gaps,
     )
     if magic_number <= 0:
         raise ValueError("magic_number must be positive")
@@ -319,6 +339,7 @@ def run_strategy_a_backtest(
         skipped_risk=skipped_risk,
         excluded_recent_bars=excluded_recent,
         history_gap_count=history_gap_count,
+        accepted_gaps=accepted_gaps,
     )
 
 

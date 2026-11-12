@@ -61,10 +61,9 @@ Implemented so far:
   an alert outbox, versioned trade audit rows, and guarded intent transitions.
 - A read-only MT5 adapter for candles, symbol specifications, and ticks, plus a
   history-cache CLI that writes closed H1/H4 candles and schema-versioned Parquet
-  manifests. Local caches cover six enabled FX pairs from 2 December 2021 through
-  30 October 2026. They do not meet the six-year target: the cache begins after
-  an unexplained six-hour EURUSD H1 gap on 2 December 2021, which remains rejected
-  rather than silently filled.
+  manifests. The cache range starts at 3 December 2021 to exclude the reported
+  2 December 2021 broker-wide outage. This is shorter than the six-year target;
+  cache manifests record actual years covered and the shortfall.
 - A separate demo-only `MT5Broker` implementing account, terminal, positions,
   history, margin, check/send, stop modification and close operations. Its
   injected fake-API tests pass, including refusal of non-demo accounts; it has
@@ -199,24 +198,44 @@ next day. A session crossing midnight must otherwise be split across weekdays.
 
 ## Cache history and run a provisional replay
 
-With the intended MT5 terminal already available, cache the enabled symbols:
+The default UTC start is `2021-12-03T00:00:00+00:00`, which excludes the
+2 December 2021 broker-wide outage; `--start-utc` can override it. First download
+and report every gap without writing a cache. This command requires the owner's
+open MT5 terminal; do not run it without that terminal:
 
 ```powershell
-python tools/cache_history.py --settings settings.toml --start-utc 2021-12-02T16:00:00+00:00
+python tools/cache_history.py --settings settings.toml --start-utc 2021-12-03T00:00:00+00:00 --report-gaps
 ```
 
-The cache command validates closed bars and fails on unexplained gaps. The start
-above avoids the currently unresolved EURUSD H1 gap; it also means this dataset
-does not cover six full years. Run a single-symbol Strategy A H1 replay and save
-multi-symbol trades, decisions, equity curve, and summary:
+`--report-gaps` never writes cache files and groups results into holiday windows,
+clock-change weekends, known single gaps, and unexpected gaps. It prints counts
+and the symbol, timeframe, UTC bounds, missing-candle count, and weekday. Rows in
+`config/known_gaps.csv` and `config/broker_holidays.csv` are drafts until
+`approved_by` and `approved_on` are both populated by the owner. Approved exact
+single-candle gaps (or up to two mid-week candles) and gaps contained in an
+approved holiday window are recorded in each cache manifest and replay/backtest
+summary. Draft or otherwise unexpected gaps prevent cache creation. Manifests
+record actual years covered against the six-year design target.
+
+After review, cache history and validate the resulting data locally:
+
+```powershell
+python tools/cache_history.py --settings settings.toml --start-utc 2021-12-03T00:00:00+00:00
+python tools/validate_cache.py --settings settings.toml
+```
+
+`validate_cache.py` is read-only and uses neither network nor MT5. It checks UTC
+candle order/duplicates, sessions and weekends, expected/known/unexpected gaps,
+OHLC/prices, weekly opens/closes across US clock changes, and six-year coverage.
+It exits non-zero for failed checks. Do not repair or interpolate missing bars.
+Replay requires reviewed `hours_utc` schedules and validated caches for every
+enabled symbol/timeframe. The owner must review/apply broker-derived hours before
+running it:
 
 ```powershell
 python tools/replay.py --settings settings.toml --strategy both --no-news
 ```
 
-Replay requires reviewed `hours_utc` schedules and validated caches for every
-enabled symbol/timeframe. The checked-in template intentionally has empty
-schedules, so the owner must review/apply broker-derived hours before running it.
 News gating stays enabled by default; `--no-news` is explicit and recorded in the
 report. By default, the most recent 12 months are excluded. Use `--final` only
 for the final evaluation run; it creates `data/reports/final-holdout.lock` with
