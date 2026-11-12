@@ -1,0 +1,7 @@
+# DRAFT rows from owner-reported common six-pair holiday gaps; approve only after checking IC Markets notices.
+start_utc,end_utc,reason,approved_by,approved_on
+2021-12-24T00:00:00+00:00,2021-12-26T00:00:00+00:00,Christmas 24-25 December 2021,,
+2021-12-26T00:00:00+00:00,2021-12-27T00:00:00+00:00,late open Sunday 26 December 2021,,
+2021-12-31T00:00:00+00:00,2022-01-02T00:00:00+00:00,year end 31 December 2021 to 1 January 2022,,
+2022-01-02T00:00:00+00:00,2022-01-03T00:00:00+00:00,late open Sunday 2 January 2022,,
+2022-12-25T00:00:00+00:00,2022-12-27T00:00:00+00:00,Christmas 25-26 December 2022,,

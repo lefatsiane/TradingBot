@@ -236,6 +236,7 @@ def read_history_cache(
     timeframe: Timeframe,
     *,
     owner_approved_gaps: tuple[dict[str, object], ...] = (),
+    owner_approved_holidays: tuple[dict[str, object], ...] = (),
 ) -> tuple[tuple[Candle, ...], HistoryManifest]:
     data_path, manifest_path = _cache_paths(Path(cache_dir), symbol, timeframe)
     try:
@@ -268,7 +269,11 @@ def read_history_cache(
     )
     manifest = _manifest_from_dict(raw_manifest)
     _validate_accepted_gap_identity(manifest.accepted_gaps, symbol, timeframe)
-    _validate_owner_approvals(manifest.accepted_gaps, owner_approved_gaps)
+    _validate_owner_approvals(
+        manifest.accepted_gaps,
+        owner_approved_gaps,
+        owner_approved_holidays,
+    )
     validate_candles(
         candles,
         timeframe,
@@ -456,25 +461,57 @@ def _accepted_gap_times(
             approval_reason = gap["approval_reason"]
             approved_by = gap["approved_by"]
             approved_on = gap["approved_on"]
+            holiday = gap.get("holiday_start_utc") is not None
+            holiday_start = (
+                _require_utc(
+                    datetime.fromisoformat(str(gap["holiday_start_utc"])),
+                    "approved holiday start",
+                )
+                if holiday
+                else None
+            )
+            holiday_end = (
+                _require_utc(
+                    datetime.fromisoformat(str(gap["holiday_end_utc"])),
+                    "approved holiday end",
+                )
+                if holiday
+                else None
+            )
         except (KeyError, TypeError, ValueError) as error:
             raise DataQualityError("Manifest contains an invalid accepted gap") from error
         if gap_timeframe != timeframe:
             continue
+        valid_holiday = (
+            holiday
+            and holiday_start is not None
+            and holiday_end is not None
+            and holiday_start <= start
+            and end <= holiday_end
+            and holiday_end > holiday_start
+        )
+        valid_known_gap = (
+            not holiday
+            and count == 1
+        ) or (
+            not holiday
+            and count == 2
+            and all(
+                (start + interval * index).weekday() in (1, 2, 3)
+                for index in range(count)
+            )
+        )
         if (
             gap.get("known") is not True
             or gap.get("accepted") is not True
             or not isinstance(count, int)
             or count < 1
-            or count > 2
             or end != start + interval * count
             or not all(
                 isinstance(value, str) and value.strip()
                 for value in (approval_reason, approved_by, approved_on)
             )
-            or any(
-                (start + interval * index).weekday() not in (1, 2, 3)
-                for index in range(count)
-            )
+            or not (valid_holiday or valid_known_gap)
         ):
             raise DataQualityError("Manifest contains an invalid accepted gap interval")
         missing.update(start + interval * index for index in range(count))
@@ -496,8 +533,25 @@ def _validate_accepted_gap_identity(
 def _validate_owner_approvals(
     accepted_gaps: tuple[dict[str, object], ...],
     owner_approved_gaps: tuple[dict[str, object], ...],
+    owner_approved_holidays: tuple[dict[str, object], ...] = (),
 ) -> None:
     for accepted in accepted_gaps:
+        if accepted.get("holiday_start_utc") is not None:
+            if not any(
+                holiday.get("start_utc") == accepted.get("holiday_start_utc")
+                and holiday.get("end_utc") == accepted.get("holiday_end_utc")
+                and holiday.get("reason") == accepted.get("approval_reason")
+                and holiday.get("approved_by") == accepted.get("approved_by")
+                and holiday.get("approved_on") == accepted.get("approved_on")
+                and holiday.get("approved_by")
+                and holiday.get("approved_on")
+                for holiday in owner_approved_holidays
+            ):
+                raise DataQualityError(
+                    "History manifest contains a holiday gap not approved in "
+                    "broker_holidays.csv"
+                )
+            continue
         if not any(
             approval.get("symbol") == accepted.get("symbol")
             and approval.get("timeframe") == accepted.get("timeframe")

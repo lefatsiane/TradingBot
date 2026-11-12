@@ -20,8 +20,10 @@ from bot.app.config import load_settings
 from bot.app.history_gaps import (
     HistoryGap,
     KnownHistoryGap,
+    KnownHolidayWindow,
     candle_is_in_session,
     inspect_history_gaps,
+    load_holiday_windows,
     load_known_gaps,
 )
 from bot.core.timeutil import expected_new_york_offset
@@ -56,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
             else settings_path.parent / "config" / "known_gaps.csv"
         )
         known_gaps = load_known_gaps(known_path)
+        holiday_path = settings_path.parent / "config" / "broker_holidays.csv"
+        holiday_windows = load_holiday_windows(holiday_path)
     except (OSError, ValueError) as error:
         parser.error(f"Could not load configuration or approved gaps: {error}")
     cache_dir = (
@@ -67,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
         cache_dir,
         settings.broker_session_hours_server_time,
         known_gaps=known_gaps,
+        holiday_windows=holiday_windows,
     )
 
 
@@ -75,6 +80,7 @@ def validate_cache(
     sessions,
     *,
     known_gaps: tuple[KnownHistoryGap, ...] = (),
+    holiday_windows: tuple[KnownHolidayWindow, ...] = (),
     design_years: float = 6.0,
 ) -> int:
     directory = Path(cache_dir)
@@ -123,6 +129,7 @@ def validate_cache(
             sessions,
             known_gaps,
             design_years,
+            holiday_windows=holiday_windows,
             manifest=manifest,
         )
         failed |= issues
@@ -144,6 +151,7 @@ def _validate_one_cache(
     known_gaps: tuple[KnownHistoryGap, ...],
     design_years: float,
     *,
+    holiday_windows: tuple[KnownHolidayWindow, ...] = (),
     manifest: dict[str, object] | None = None,
 ) -> bool:
     failed = False
@@ -188,6 +196,7 @@ def _validate_one_cache(
         timeframe,
         sessions,
         known_gaps,
+        holiday_windows=holiday_windows,
     )
     unexpected = [gap for gap in gaps if not gap.accepted]
     accepted = [gap for gap in gaps if gap.accepted]

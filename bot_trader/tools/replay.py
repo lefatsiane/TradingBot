@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from bot.adapters.broker import SymbolSpec
 from bot.app.config import Settings, load_settings
 from bot.app.data import Candle, DataQualityError, Timeframe, read_history_cache
-from bot.app.history_gaps import load_known_gaps
+from bot.app.history_gaps import load_holiday_windows, load_known_gaps
 from bot.app.replay_runner import (
     claim_final_holdout_lock,
     run_replay,
@@ -102,8 +102,14 @@ def main() -> None:
                 settings_path.parent / "config" / "known_gaps.csv"
             )
         )
+        owner_approved_holidays = tuple(
+            holiday.as_dict()
+            for holiday in load_holiday_windows(
+                settings_path.parent / "config" / "broker_holidays.csv"
+            )
+        )
     except (OSError, ValueError) as error:
-        parser.error(f"Could not load approved gaps ({type(error).__name__}): {error}")
+        parser.error(f"Could not load history approvals ({type(error).__name__}): {error}")
     timeframes: tuple[Timeframe, ...] = (
         settings.strategy_a.timeframes
         if args.strategy == "a"
@@ -124,6 +130,7 @@ def main() -> None:
                     symbol,
                     timeframe,
                     owner_approved_gaps=owner_approved_gaps,
+                    owner_approved_holidays=owner_approved_holidays,
                 )
                 if manifest.symbol_spec is None:
                     parser.error(

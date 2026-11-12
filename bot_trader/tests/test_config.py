@@ -225,7 +225,17 @@ def test_enabled_symbols_require_non_overlapping_friday_schedules() -> None:
     source = Path(__file__).parents[1] / "settings.toml"
     settings, _ = load_settings(source)
     summer_now = datetime(2026, 7, 7, 12, tzinfo=UTC)
-    failures = schedule_validation_failures(settings, now_utc=summer_now)
+    unscheduled = settings.model_copy(
+        update={
+            "symbols": {
+                symbol: symbol_settings.model_copy(
+                    update={"hours_utc": (), "hours_utc_season": None}
+                )
+                for symbol, symbol_settings in settings.symbols.items()
+            }
+        }
+    )
+    failures = schedule_validation_failures(unscheduled, now_utc=summer_now)
     assert len(failures) == 6
     assert all("hours_utc is empty" in failure for failure in failures)
     assert not any("XAUUSD" in failure for failure in failures)

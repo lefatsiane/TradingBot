@@ -17,8 +17,15 @@ from bot.app.data import (
     validate_history_end,
     write_history_cache,
 )
-from bot.app.history_gaps import HistoryGap, inspect_history_gaps, load_known_gaps
+from bot.app.history_gaps import (
+    HistoryGap,
+    inspect_history_gaps,
+    load_holiday_windows,
+    load_known_gaps,
+)
 from bot.core.types import Candle, SymbolSpec
+
+_DEFAULT_START_UTC = datetime(2021, 12, 3, tzinfo=UTC)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -29,7 +36,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--start-utc",
         type=_parse_utc,
-        help="UTC inclusive start (default: six years before --end-utc).",
+        help=(
+            "UTC inclusive start (default: 2021-12-03T00:00:00+00:00; "
+            "excludes the 2021-12-02 broker-wide outage)."
+        ),
     )
     parser.add_argument("--end-utc", type=_parse_utc)
     parser.add_argument("--cache-dir")
@@ -55,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     settings, _ = load_settings(settings_path)
     now_utc = datetime.now(tz=UTC)
     end_utc = args.end_utc or now_utc
-    start_utc = args.start_utc or _years_before(end_utc, 6)
+    start_utc = args.start_utc or _DEFAULT_START_UTC
     if start_utc >= end_utc:
         parser.error("--start-utc must be earlier than --end-utc")
     enabled_symbols = {
@@ -77,8 +87,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         known_gaps = load_known_gaps(known_gaps_path)
+        holiday_windows = load_holiday_windows(
+            settings_path.parent / "config" / "broker_holidays.csv"
+        )
     except (OSError, ValueError) as error:
-        parser.error(f"Could not load approved gaps ({type(error).__name__}): {error}")
+        parser.error(f"Could not load gap approvals ({type(error).__name__}): {error}")
 
     broker = MT5ReadOnlyBroker(
         history_start_utc=start_utc,
@@ -95,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
             tuple[dict[str, object], ...],
         ]
     ] = []
+    reported_gaps: list[HistoryGap] = []
     try:
         for symbol in sorted(symbols):
             try:
@@ -122,13 +136,14 @@ def main(argv: list[str] | None = None) -> int:
                         timeframe,
                         settings.broker_session_hours_server_time,
                         known_gaps,
+                        holiday_windows=holiday_windows,
                     )
                 except (DataQualityError, RuntimeError, ValueError) as error:
                     failures.append(f"{symbol} {timeframe}: {error}")
                     print(f"{symbol} {timeframe}: history cache failed: {error}")
                     continue
                 unexpected = [gap for gap in gaps if not gap.accepted]
-                _print_gaps(unexpected)
+                reported_gaps.extend(gaps)
                 if unexpected:
                     failures.extend(
                         f"{symbol} {timeframe}: unexpected gap "
@@ -159,6 +174,7 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 pending.append((symbol, timeframe, closed, spec, accepted))
         if args.report_gaps:
+            _print_gaps_grouped(reported_gaps)
             print(
                 "Gap report complete; no cache files were written."
             )
@@ -192,9 +208,21 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _print_gaps(gaps: list[HistoryGap]) -> None:
-    for gap in gaps:
-        _print_gap(gap, prefix="UNEXPECTED")
+def _print_gaps_grouped(gaps: list[HistoryGap]) -> None:
+    categories = (
+        "holiday window",
+        "clock-change weekend",
+        "known single gap",
+        "unexpected",
+    )
+    unexpected_count = sum(not gap.accepted for gap in gaps)
+    print(f"GAP SUMMARY: {len(gaps)} total; {unexpected_count} unexpected")
+    for category in categories:
+        selected = [gap for gap in gaps if gap.category == category]
+        print(f"\n{category.upper()} ({len(selected)})")
+        for gap in selected:
+            prefix = "APPROVED" if gap.accepted else "UNEXPECTED"
+            _print_gap(gap, prefix=prefix)
 
 
 def _print_gap(gap: HistoryGap, *, prefix: str) -> None:
@@ -206,11 +234,16 @@ def _print_gap(gap: HistoryGap, *, prefix: str) -> None:
         if gap.accepted
         else ""
     )
+    classification = (
+        f"; draft classification: {gap.source_category}"
+        if gap.source_category and not gap.accepted
+        else ""
+    )
     print(
         f"{prefix} GAP {gap.symbol} {gap.timeframe}: "
         f"{gap.start_utc.isoformat()} to {gap.end_utc.isoformat()} (exclusive); "
         f"{gap.missing_candles} missing candle(s); weekday(s): {weekdays}"
-        f"{reason}{approval}"
+        f"{reason}{approval}{classification}"
     )
 
 
@@ -222,13 +255,6 @@ def _parse_utc(value: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
         raise argparse.ArgumentTypeError("Timestamp must include a UTC offset of +00:00")
     return parsed.astimezone(UTC)
-
-
-def _years_before(value: datetime, years: int) -> datetime:
-    try:
-        return value.replace(year=value.year - years)
-    except ValueError:
-        return value.replace(year=value.year - years, day=28)
 
 
 if __name__ == "__main__":

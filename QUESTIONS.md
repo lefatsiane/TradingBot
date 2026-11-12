@@ -42,9 +42,20 @@
   The wall-clock hour occurs twice and a raw server-wall timestamp alone cannot identify which UTC
   hour it represents; confirm whether MT5 returns an additional disambiguating field or omits one
   of the repeated bars.
-- `config/known_gaps.csv` intentionally contains only its header and an explanatory comment. The
-  validator treats "mid-week" as Tuesday through Thursday, and requires exact approved start/end
-  bounds and missing-candle count. Confirm this definition before adding any owner-approved row.
-- `--report-gaps` has been implemented without being run because it requires MT5. The broker-wide
-  December 2021 outage and the June 2026 gaps therefore remain unverified against a complete,
-  all-jobs download; the owner must run the report mode and review its full output.
+- `config/known_gaps.csv` contains the owner-reported single-candle DRAFT rows. They remain
+  unexpected until both approval fields are populated by the owner. Approved two-candle exceptions
+  remain limited to Tuesday through Thursday.
+- `config/broker_holidays.csv` contains DRAFT date windows from the owner-reported common holiday
+  gaps. The listed bounds are date-level placeholders; confirm exact UTC gap bounds against the
+  complete report and IC Markets' holiday notice before approving them. The cache accepts no
+  holiday window while either approval field is empty.
+- `--report-gaps` was run by the owner and reported 229 gaps. The implementation now groups report
+  output by holiday window, clock-change weekend, known single gap, and unexpected; do not infer
+  that any DRAFT gap is accepted.
+- The default cache start is `2021-12-03T00:00:00+00:00`, excluding the 2 December 2021 broker
+  outage. From that start through 2026-11-11 is about 4.939 years against the six-year design
+  target (about 1.061 years short); actual cache manifests calculate coverage from their first and
+  last candles.
+- Before the next year-end, the live bot must treat broker holiday closures as market-closed:
+  no stale-data halts and no trading during the closure. Confirm the broker's exact holiday trading
+  hours against IC Markets' notice before enabling that behavior.

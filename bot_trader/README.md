@@ -61,10 +61,9 @@ Implemented so far:
   an alert outbox, versioned trade audit rows, and guarded intent transitions.
 - A read-only MT5 adapter for candles, symbol specifications, and ticks, plus a
   history-cache CLI that writes closed H1/H4 candles and schema-versioned Parquet
-  manifests. Local caches cover six enabled FX pairs from 2 December 2021 through
-  30 October 2026. They do not meet the six-year target: the cache begins after
-  an unexplained six-hour EURUSD H1 gap on 2 December 2021, which remains rejected
-  rather than silently filled.
+  manifests. The cache range starts at 3 December 2021 to exclude the reported
+  2 December 2021 broker-wide outage. This is shorter than the six-year target;
+  cache manifests record actual years covered and the shortfall.
 - A separate demo-only `MT5Broker` implementing account, terminal, positions,
   history, margin, check/send, stop modification and close operations. Its
   injected fake-API tests pass, including refusal of non-demo accounts; it has
@@ -199,21 +198,24 @@ next day. A session crossing midnight must otherwise be split across weekdays.
 
 ## Cache history and run a provisional replay
 
-First download and report every gap without writing a cache. This command requires
-the owner's open MT5 terminal; do not run it without that terminal:
+The default UTC start is `2021-12-03T00:00:00+00:00`, which excludes the
+2 December 2021 broker-wide outage; `--start-utc` can override it. First download
+and report every gap without writing a cache. This command requires the owner's
+open MT5 terminal; do not run it without that terminal:
 
 ```powershell
 python tools/cache_history.py --settings settings.toml --start-utc 2021-12-03T00:00:00+00:00 --report-gaps
 ```
 
-`--report-gaps` never writes cache files and lists every unexpected gap with its
-symbol, timeframe, UTC bounds, missing-candle count, and weekday. After reviewing
-the report, an owner may add approved rows to `config/known_gaps.csv`; the bot
-does not create approvals. Only exact approved gaps of at most two consecutive
-missing candles on Tuesday through Thursday are accepted. Accepted gaps appear
-in each cache manifest and in replay/backtest summaries. Any other unexpected
-gap prevents cache creation. Manifests record years covered against the six-year
-design target.
+`--report-gaps` never writes cache files and groups results into holiday windows,
+clock-change weekends, known single gaps, and unexpected gaps. It prints counts
+and the symbol, timeframe, UTC bounds, missing-candle count, and weekday. Rows in
+`config/known_gaps.csv` and `config/broker_holidays.csv` are drafts until
+`approved_by` and `approved_on` are both populated by the owner. Approved exact
+single-candle gaps (or up to two mid-week candles) and gaps contained in an
+approved holiday window are recorded in each cache manifest and replay/backtest
+summary. Draft or otherwise unexpected gaps prevent cache creation. Manifests
+record actual years covered against the six-year design target.
 
 After review, cache history and validate the resulting data locally:
 
