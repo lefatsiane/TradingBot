@@ -25,7 +25,7 @@ from bot.app.history_gaps import (
 )
 from bot.core.types import Candle, SymbolSpec
 
-_DEFAULT_START_UTC = datetime(2021, 12, 3, tzinfo=UTC)
+_DEFAULT_START_UTC = datetime(2020, 11, 8, tzinfo=UTC)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,8 +37,8 @@ def main(argv: list[str] | None = None) -> int:
         "--start-utc",
         type=_parse_utc,
         help=(
-            "UTC inclusive start (default: 2021-12-03T00:00:00+00:00; "
-            "excludes the 2021-12-02 broker-wide outage)."
+            "UTC inclusive start (default: 2020-11-08T00:00:00+00:00; "
+            "the Sunday before the first full trading week)."
         ),
     )
     parser.add_argument("--end-utc", type=_parse_utc)

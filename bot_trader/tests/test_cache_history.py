@@ -97,7 +97,7 @@ def test_cache_history_uses_documented_default_start(monkeypatch, tmp_path) -> N
 
         def candles(self, _symbol: str, _timeframe: str) -> tuple[Candle, ...]:
             return tuple(
-                Candle(datetime(2021, 12, 3, hour, tzinfo=UTC), 1.1, 1.101, 1.099, 1.1)
+                Candle(datetime(2020, 11, 8, hour, tzinfo=UTC), 1.1, 1.101, 1.099, 1.1)
                 for hour in (0, 1)
             )
 
@@ -110,13 +110,13 @@ def test_cache_history_uses_documented_default_start(monkeypatch, tmp_path) -> N
             "--settings", str(settings_path),
             "--symbols", "EURUSD",
             "--timeframes", "H1",
-            "--end-utc", "2021-12-03T03:00:00+00:00",
+            "--end-utc", "2020-11-08T03:00:00+00:00",
             "--cache-dir", str(tmp_path / "history"),
         ]
     )
 
     assert result == 0
-    assert broker_args["history_start_utc"] == datetime(2021, 12, 3, tzinfo=UTC)
+    assert broker_args["history_start_utc"] == datetime(2020, 11, 8, tzinfo=UTC)
 
 
 def test_gap_report_categories_show_drafts_as_unexpected(capsys) -> None:

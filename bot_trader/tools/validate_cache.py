@@ -30,6 +30,8 @@ from bot.core.timeutil import expected_new_york_offset
 
 _CACHE_NAME = re.compile(r"^(?P<symbol>[A-Za-z0-9]+)_(?P<timeframe>H1|H4)\.parquet$")
 _YEAR_SECONDS = 365.2425 * 24 * 60 * 60
+_DEFAULT_START_UTC = datetime(2020, 11, 8, tzinfo=UTC)
+_TIMEFRAME_INTERVAL = {"H1": timedelta(hours=1), "H4": timedelta(hours=4)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +43,13 @@ class CacheCandle:
     close: float
 
 
+@dataclass(frozen=True, slots=True)
+class WeeklyBoundaryCheck:
+    week_start: date
+    status: str
+    detail: str = ""
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Read-only validation of cached UTC history (no network or MT5)."
@@ -48,6 +57,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--settings", default="settings.toml")
     parser.add_argument("--cache-dir")
     parser.add_argument("--known-gaps")
+    parser.add_argument(
+        "--start-utc",
+        type=_parse_utc,
+        default=_DEFAULT_START_UTC,
+        help=(
+            "Expected UTC history start for coverage and partial-week checks "
+            "(default: 2020-11-08T00:00:00+00:00)."
+        ),
+    )
     args = parser.parse_args(argv)
     settings_path = Path(args.settings).resolve()
     try:
@@ -72,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
         settings.broker_session_hours_server_time,
         known_gaps=known_gaps,
         holiday_windows=holiday_windows,
+        coverage_start_utc=args.start_utc,
     )
 
 
@@ -82,7 +101,11 @@ def validate_cache(
     known_gaps: tuple[KnownHistoryGap, ...] = (),
     holiday_windows: tuple[KnownHolidayWindow, ...] = (),
     design_years: float = 6.0,
+    coverage_start_utc: datetime = _DEFAULT_START_UTC,
+    current_utc: datetime | None = None,
 ) -> int:
+    now_utc = (current_utc or datetime.now(UTC)).astimezone(UTC)
+    coverage_start = coverage_start_utc.astimezone(UTC)
     directory = Path(cache_dir)
     files = sorted(directory.glob("*.parquet")) if directory.is_dir() else []
     cache_files = [
@@ -108,7 +131,9 @@ def validate_cache(
             print(f"{symbol} {timeframe}: FAIL: no candles")
             failed = True
             continue
-        coverage = _years_covered([candles[0].time, candles[-1].time])
+        interval = _TIMEFRAME_INTERVAL[timeframe]
+        coverage_end = candles[-1].time + interval
+        coverage = _years_between(coverage_start, coverage_end)
         cache_years.append(coverage)
         manifest_path = path.with_suffix(".manifest.json")
         try:
@@ -130,11 +155,17 @@ def validate_cache(
             known_gaps,
             design_years,
             holiday_windows=holiday_windows,
+            coverage_start_utc=coverage_start,
+            current_utc=now_utc,
             manifest=manifest,
         )
         failed |= issues
 
     years = min(cache_years) if cache_years else 0.0
+    print(
+        "COVERAGE BASIS: expected start through last closed candle "
+        "(last candle open + timeframe interval)."
+    )
     print(f"TOTAL YEARS COVERED: {years:.3f}/{design_years:.3f}")
     if years < design_years:
         print(f"FAIL: history coverage is short by {design_years - years:.3f} years")
@@ -152,14 +183,21 @@ def _validate_one_cache(
     design_years: float,
     *,
     holiday_windows: tuple[KnownHolidayWindow, ...] = (),
+    coverage_start_utc: datetime | None = None,
+    current_utc: datetime | None = None,
     manifest: dict[str, object] | None = None,
 ) -> bool:
     failed = False
     first, last = candles[0].time, candles[-1].time
-    years = _years_covered([first, last])
+    interval = _TIMEFRAME_INTERVAL[timeframe]
+    coverage_start = (coverage_start_utc or first).astimezone(UTC)
+    coverage_end = last + interval
+    years = _years_between(coverage_start, coverage_end)
+    data_span_years = _years_covered([first, last])
     print(
         f"{symbol} {timeframe}: first {first.isoformat()}, last {last.isoformat()}, "
-        f"count {len(candles)}, years {years:.3f}/{design_years:.3f}"
+        f"count {len(candles)}, coverage {years:.3f}/{design_years:.3f} years "
+        f"({coverage_start.isoformat()} to last close {coverage_end.isoformat()})"
     )
     counts = Counter(candle.time for candle in candles)
     duplicates = sorted(value for value, count in counts.items() if count > 1)
@@ -217,7 +255,7 @@ def _validate_one_cache(
             or manifest.get("end_utc") != last.isoformat()
             or manifest.get("design_years") != 6
             or not isinstance(manifest.get("years_covered"), (float, int))
-            or abs(float(manifest["years_covered"]) - years) > 0.000001
+            or abs(float(manifest["years_covered"]) - data_span_years) > 0.000001
             or manifest_gaps != expected_manifest_gaps
         ):
             print("  FAIL: cache manifest does not match data/approved gaps")
@@ -237,19 +275,25 @@ def _validate_one_cache(
     failed |= _report_times("invalid OHLC values", bad_ohlc)
     failed |= _report_times("zero or negative prices", bad_prices)
 
-    bad_weeks = _weekly_boundary_failures(candles)
-    if bad_weeks:
-        print("  FAIL: weekly open/close:")
-        for week in bad_weeks:
-            print(f"    {week}")
-        failed = True
-    else:
-        weeks = {
-            candle.time.date()
-            - timedelta(days=(candle.time.weekday() + 1) % 7)
-            for candle in candles
-        }
-        print(f"  Weekly open/close check: PASS ({len(weeks)} weeks checked)")
+    weekly_checks = _weekly_boundary_checks(
+        candles,
+        symbol=symbol,
+        timeframe=timeframe,
+        known_gaps=known_gaps,
+        holiday_windows=holiday_windows,
+        coverage_start_utc=coverage_start_utc,
+        current_utc=current_utc,
+    )
+    weekly_counts = Counter(check.status for check in weekly_checks)
+    print(
+        f"  WEEKLY SUMMARY {symbol} {timeframe}: "
+        f"PASS={weekly_counts['PASS']} EXPLAINED={weekly_counts['EXPLAINED']} "
+        f"SKIPPED={weekly_counts['SKIPPED']} FAIL={weekly_counts['FAIL']}"
+    )
+    for check in weekly_checks:
+        if check.status != "PASS":
+            print(f"    {check.status} {check.week_start}: {check.detail}")
+    failed |= any(check.status == "FAIL" for check in weekly_checks)
 
     if years < design_years:
         print(f"  FAIL: coverage shortfall {design_years - years:.3f} years")
@@ -258,30 +302,167 @@ def _validate_one_cache(
 
 
 def _weekly_boundary_failures(candles: tuple[CacheCandle, ...]) -> list[str]:
+    return [
+        check.detail
+        for check in _weekly_boundary_checks(candles)
+        if check.status == "FAIL"
+    ]
+
+
+def _weekly_boundary_checks(
+    candles: tuple[CacheCandle, ...],
+    *,
+    symbol: str = "",
+    timeframe: str = "H1",
+    known_gaps: tuple[KnownHistoryGap, ...] = (),
+    holiday_windows: tuple[KnownHolidayWindow, ...] = (),
+    coverage_start_utc: datetime | None = None,
+    current_utc: datetime | None = None,
+) -> list[WeeklyBoundaryCheck]:
     week_groups: dict[date, list[CacheCandle]] = defaultdict(list)
     for candle in candles:
         week_start = candle.time.date() - timedelta(
             days=(candle.time.weekday() + 1) % 7
         )
         week_groups[week_start].append(candle)
-    bad_weeks: list[str] = []
+    checks: list[WeeklyBoundaryCheck] = []
+    now = (current_utc or datetime.now(UTC)).astimezone(UTC)
+    first_week = min(week_groups) if week_groups else None
+    start = coverage_start_utc.astimezone(UTC) if coverage_start_utc else None
     for week_start, week_candles in sorted(week_groups.items()):
         week_candles.sort(key=lambda candle: candle.time)
         first_candle, last_candle = week_candles[0], week_candles[-1]
-        first_hour = 21 if expected_new_york_offset(first_candle.time) == 3 else 22
-        last_hour = 20 if expected_new_york_offset(last_candle.time) == 3 else 21
+        open_hour = _expected_week_open_hour(week_start)
+        expected_open = datetime.combine(
+            week_start, datetime.min.time(), tzinfo=UTC
+        ) + timedelta(hours=open_hour)
+        h1_last_hour = _expected_h1_last_hour(week_start)
+        expected_last = datetime.combine(
+            week_start + timedelta(days=5),
+            datetime.min.time(),
+            tzinfo=UTC,
+        ) + timedelta(hours=h1_last_hour - (3 if timeframe == "H4" else 0))
+
         if (
-            first_candle.time.hour != first_hour
-            or first_candle.time.minute != 0
-            or last_candle.time.hour != last_hour
-            or last_candle.time.minute != 0
+            week_start == first_week
+            and start is not None
+            and start > expected_open
         ):
-            bad_weeks.append(
-                f"{week_start}: open {first_candle.time.isoformat()} "
-                f"(expected {first_hour:02d}:00), close {last_candle.time.isoformat()} "
-                f"(expected {last_hour:02d}:00)"
+            checks.append(
+                WeeklyBoundaryCheck(
+                    week_start,
+                    "SKIPPED",
+                    f"partial first week: requested start {start.isoformat()} "
+                    f"is after expected open {expected_open.isoformat()}",
+                )
             )
-    return bad_weeks
+            continue
+        interval = _TIMEFRAME_INTERVAL[timeframe]
+        if week_start == _week_start(now.date()) and expected_last + interval > now:
+            checks.append(
+                WeeklyBoundaryCheck(
+                    week_start,
+                    "SKIPPED",
+                    f"current incomplete week: expected final candle closes "
+                    f"{(expected_last + interval).isoformat()}",
+                )
+            )
+            continue
+
+        deviations: list[str] = []
+        explanations: list[str] = []
+        if first_candle.time != expected_open:
+            approved = _approved_boundary_row(
+                expected_open,
+                symbol,
+                timeframe,
+                known_gaps,
+                holiday_windows,
+            )
+            if approved:
+                explanations.append(
+                    f"expected open {expected_open.isoformat()} is covered by {approved}"
+                )
+            else:
+                deviations.append(
+                    f"open {first_candle.time.isoformat()} "
+                    f"(expected {expected_open.isoformat()})"
+                )
+        if last_candle.time != expected_last:
+            approved = _approved_boundary_row(
+                expected_last,
+                symbol,
+                timeframe,
+                known_gaps,
+                holiday_windows,
+            )
+            if approved:
+                explanations.append(
+                    f"expected last {expected_last.isoformat()} is covered by {approved}"
+                )
+            else:
+                deviations.append(
+                    f"close {last_candle.time.isoformat()} "
+                    f"(expected {expected_last.isoformat()})"
+                )
+        if deviations:
+            checks.append(
+                WeeklyBoundaryCheck(
+                    week_start,
+                    "FAIL",
+                    f"{week_start}: " + "; ".join(deviations),
+                )
+            )
+        elif explanations:
+            checks.append(
+                WeeklyBoundaryCheck(week_start, "EXPLAINED", "; ".join(explanations))
+            )
+        else:
+            checks.append(WeeklyBoundaryCheck(week_start, "PASS"))
+    return checks
+
+
+def _expected_week_open_hour(week_start: date) -> int:
+    candidate = datetime.combine(week_start, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=21
+    )
+    return 21 if expected_new_york_offset(candidate) == 3 else 22
+
+
+def _expected_h1_last_hour(week_start: date) -> int:
+    friday = week_start + timedelta(days=5)
+    candidate = datetime.combine(friday, datetime.min.time(), tzinfo=UTC) + timedelta(
+        hours=20
+    )
+    return 20 if expected_new_york_offset(candidate) == 3 else 21
+
+
+def _approved_boundary_row(
+    expected: datetime,
+    symbol: str,
+    timeframe: str,
+    known_gaps: tuple[KnownHistoryGap, ...],
+    holiday_windows: tuple[KnownHolidayWindow, ...],
+) -> str | None:
+    for holiday in holiday_windows:
+        if (
+            holiday.approved
+            and holiday.start_utc <= expected < holiday.end_utc
+        ):
+            return f"approved broker_holidays.csv row {holiday.reason!r}"
+    for gap in known_gaps:
+        if (
+            gap.approved
+            and gap.symbol == symbol
+            and gap.timeframe == timeframe
+            and gap.start_utc <= expected < gap.end_utc
+        ):
+            return f"approved known_gaps.csv row {gap.reason!r}"
+    return None
+
+
+def _week_start(day: date) -> date:
+    return day - timedelta(days=(day.weekday() + 1) % 7)
 
 
 def _candles_from_frame(frame: pd.DataFrame) -> tuple[CacheCandle, ...]:
@@ -309,6 +490,20 @@ def _years_covered(times: list[datetime]) -> float:
     if len(times) < 2:
         return 0.0
     return (max(times) - min(times)).total_seconds() / _YEAR_SECONDS
+
+
+def _years_between(start: datetime, end: datetime) -> float:
+    return max(0.0, (end - start).total_seconds() / _YEAR_SECONDS)
+
+
+def _parse_utc(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"Invalid ISO timestamp: {value}") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise argparse.ArgumentTypeError("Timestamp must include a UTC offset of +00:00")
+    return parsed.astimezone(UTC)
 
 
 def _report_times(label: str, values: list[datetime]) -> bool:

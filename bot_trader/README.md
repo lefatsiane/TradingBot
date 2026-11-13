@@ -61,9 +61,10 @@ Implemented so far:
   an alert outbox, versioned trade audit rows, and guarded intent transitions.
 - A read-only MT5 adapter for candles, symbol specifications, and ticks, plus a
   history-cache CLI that writes closed H1/H4 candles and schema-versioned Parquet
-  manifests. The cache range starts at 3 December 2021 to exclude the reported
-  2 December 2021 broker-wide outage. This is shorter than the six-year target;
-  cache manifests record actual years covered and the shortfall.
+  manifests. Its default range starts at 8 November 2020, the Sunday before the
+  first full trading week, to reach the six-year target. Approved gaps remain
+  recorded in manifests; the 2 December 2021 outage is retained as a gap and is
+  never filled.
 - A separate demo-only `MT5Broker` implementing account, terminal, positions,
   history, margin, check/send, stop modification and close operations. Its
   injected fake-API tests pass, including refusal of non-demo accounts; it has
@@ -198,13 +199,14 @@ next day. A session crossing midnight must otherwise be split across weekdays.
 
 ## Cache history and run a provisional replay
 
-The default UTC start is `2021-12-03T00:00:00+00:00`, which excludes the
-2 December 2021 broker-wide outage; `--start-utc` can override it. First download
-and report every gap without writing a cache. This command requires the owner's
-open MT5 terminal; do not run it without that terminal:
+The default UTC start is `2020-11-08T00:00:00+00:00`, the Sunday before the first
+full trading week; `--start-utc` can override it. The known 2 December 2021 outage
+is retained as an approved gap, not filled. First download and report every gap
+without writing a cache. This command requires the owner's open MT5 terminal; do
+not run it without that terminal:
 
 ```powershell
-python tools/cache_history.py --settings settings.toml --start-utc 2021-12-03T00:00:00+00:00 --report-gaps
+python tools/cache_history.py --settings settings.toml --start-utc 2020-11-08T00:00:00+00:00 --report-gaps
 ```
 
 `--report-gaps` never writes cache files and groups results into holiday windows,
@@ -220,13 +222,16 @@ record actual years covered against the six-year design target.
 After review, cache history and validate the resulting data locally:
 
 ```powershell
-python tools/cache_history.py --settings settings.toml --start-utc 2021-12-03T00:00:00+00:00
+python tools/cache_history.py --settings settings.toml --start-utc 2020-11-08T00:00:00+00:00
 python tools/validate_cache.py --settings settings.toml
 ```
 
 `validate_cache.py` is read-only and uses neither network nor MT5. It checks UTC
 candle order/duplicates, sessions and weekends, expected/known/unexpected gaps,
 OHLC/prices, weekly opens/closes across US clock changes, and six-year coverage.
+It reports per-symbol/timeframe PASS, EXPLAINED, SKIPPED, and FAIL weekly counts.
+Coverage is measured from the expected start through the last candle's close.
+Incomplete first/current weeks are skipped; approved boundary gaps are explained.
 It exits non-zero for failed checks. Do not repair or interpolate missing bars.
 Replay requires reviewed `hours_utc` schedules and validated caches for every
 enabled symbol/timeframe. The owner must review/apply broker-derived hours before

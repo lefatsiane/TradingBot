@@ -281,15 +281,15 @@ def test_draft_holiday_gap_remains_unexpected(tmp_path: Path) -> None:
     assert gaps[0].source_category == "holiday window"
 
 
-def test_checked_in_gap_and_holiday_rows_are_drafts_only() -> None:
+def test_checked_in_owner_approved_gap_and_holiday_rows_are_loaded() -> None:
     config_dir = Path(__file__).parents[1] / "config"
     known = load_known_gaps(config_dir / "known_gaps.csv")
     holidays = load_holiday_windows(config_dir / "broker_holidays.csv")
 
     assert len(known) == 13
-    assert all(not gap.approved for gap in known)
-    assert len(holidays) == 5
-    assert all(not holiday.approved for holiday in holidays)
+    assert all(gap.approved for gap in known)
+    assert len(holidays) == 14
+    assert all(holiday.approved for holiday in holidays)
 
 
 def test_partial_approval_metadata_is_rejected(tmp_path: Path) -> None:

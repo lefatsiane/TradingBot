@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 import pytest
 
 from bot.app.config import BrokerSessionHoursServerTime
-from bot.app.history_gaps import candle_is_in_session
+from bot.app.history_gaps import (
+    KnownHistoryGap,
+    candle_is_in_session,
+)
 from tools.validate_cache import (
     CacheCandle,
     _candles_from_frame,
     _validate_one_cache,
+    _weekly_boundary_checks,
     _weekly_boundary_failures,
     validate_cache,
 )
@@ -157,10 +161,16 @@ def test_validator_reports_total_years_and_shortfall(tmp_path, capsys) -> None:
     )
     frame.to_parquet(tmp_path / "EURUSD_H1.parquet", engine="pyarrow")
 
-    assert validate_cache(tmp_path, SESSIONS, design_years=0.1) == 1
+    assert validate_cache(
+        tmp_path,
+        SESSIONS,
+        design_years=0.1,
+        coverage_start_utc=datetime(2026, 6, 30, 8, tzinfo=UTC),
+    ) == 1
     output = capsys.readouterr().out
     assert "TOTAL YEARS COVERED:" in output
     assert "coverage shortfall" in output
+    assert "COVERAGE BASIS: expected start through last closed candle" in output
 
 
 def test_year_coverage_shortfall_is_a_failure(capsys) -> None:
@@ -171,3 +181,215 @@ def test_year_coverage_shortfall_is_a_failure(capsys) -> None:
 
     assert _validate_one_cache(candles, "EURUSD", "H1", SESSIONS, (), 6)
     assert "coverage shortfall" in capsys.readouterr().out
+
+
+def _week_boundary_candles(
+    week_start: datetime,
+    timeframe: str,
+    *,
+    open_delta: timedelta = timedelta(0),
+    last_delta: timedelta = timedelta(0),
+) -> tuple[CacheCandle, CacheCandle]:
+    is_summer = week_start.month in (4, 5, 6, 7, 8, 9, 10)
+    open_hour = 21 if is_summer else 22
+    h1_last_hour = 20 if is_summer else 21
+    last_hour = h1_last_hour - (3 if timeframe == "H4" else 0)
+    open_at = week_start.replace(hour=open_hour) + open_delta
+    last_at = (week_start + timedelta(days=5)).replace(hour=last_hour) + last_delta
+    return _candle(open_at), _candle(last_at)
+
+
+@pytest.mark.parametrize(
+    ("week_start", "timeframe"),
+    [
+        (datetime(2026, 1, 4, tzinfo=UTC), "H1"),
+        (datetime(2026, 7, 5, tzinfo=UTC), "H1"),
+    ],
+)
+def test_week_open_one_hour_late_without_approval_fails(
+    week_start: datetime,
+    timeframe: str,
+) -> None:
+    candles = _week_boundary_candles(
+        week_start,
+        timeframe,
+        open_delta=timedelta(hours=1),
+    )
+
+    checks = _weekly_boundary_checks(
+        candles,
+        symbol="EURUSD",
+        timeframe=timeframe,
+        current_utc=week_start + pd.Timedelta(days=7),
+    )
+
+    assert [check.status for check in checks] == ["FAIL"]
+    assert "open" in checks[0].detail
+
+
+@pytest.mark.parametrize(
+    ("week_start", "timeframe"),
+    [
+        (datetime(2026, 1, 4, tzinfo=UTC), "H1"),
+        (datetime(2026, 7, 5, tzinfo=UTC), "H1"),
+    ],
+)
+def test_week_closing_early_without_approval_fails(
+    week_start: datetime,
+    timeframe: str,
+) -> None:
+    candles = _week_boundary_candles(
+        week_start,
+        timeframe,
+        last_delta=-timedelta(hours=1),
+    )
+
+    checks = _weekly_boundary_checks(
+        candles,
+        symbol="EURUSD",
+        timeframe=timeframe,
+        current_utc=week_start + pd.Timedelta(days=7),
+    )
+
+    assert [check.status for check in checks] == ["FAIL"]
+    assert "close" in checks[0].detail
+
+
+@pytest.mark.parametrize(
+    ("week_start", "timeframe"),
+    [
+        (datetime(2026, 1, 4, tzinfo=UTC), "H1"),
+        (datetime(2026, 7, 5, tzinfo=UTC), "H1"),
+    ],
+)
+def test_week_open_deviation_inside_approved_gap_is_explained(
+    week_start: datetime,
+    timeframe: str,
+) -> None:
+    expected_open_hour = 22 if week_start.month == 1 else 21
+    expected_open = week_start.replace(hour=expected_open_hour)
+    candles = _week_boundary_candles(
+        week_start,
+        timeframe,
+        open_delta=timedelta(hours=1),
+    )
+    approved_gap = KnownHistoryGap(
+        "EURUSD",
+        timeframe,
+        expected_open,
+        expected_open + timedelta(hours=1),
+        1,
+        "approved weekly opening gap",
+        "Lefa",
+        "2026-11-12",
+    )
+
+    checks = _weekly_boundary_checks(
+        candles,
+        symbol="EURUSD",
+        timeframe=timeframe,
+        known_gaps=(approved_gap,),
+        current_utc=week_start + pd.Timedelta(days=7),
+    )
+
+    assert [check.status for check in checks] == ["EXPLAINED"]
+    assert "approved known_gaps.csv row" in checks[0].detail
+
+
+@pytest.mark.parametrize(
+    ("week_start", "expected_last"),
+    [
+        (datetime(2026, 1, 4, tzinfo=UTC), datetime(2026, 1, 9, 18, tzinfo=UTC)),
+        (datetime(2026, 7, 5, tzinfo=UTC), datetime(2026, 7, 10, 17, tzinfo=UTC)),
+    ],
+)
+def test_h4_last_candle_expected_open_time_passes(
+    week_start: datetime,
+    expected_last: datetime,
+) -> None:
+    open_candle, last_candle = _week_boundary_candles(week_start, "H4")
+
+    assert last_candle.time == expected_last
+    checks = _weekly_boundary_checks(
+        (open_candle, last_candle),
+        timeframe="H4",
+        current_utc=week_start + pd.Timedelta(days=7),
+    )
+
+    assert [check.status for check in checks] == ["PASS"]
+
+
+@pytest.mark.parametrize(
+    ("week_start", "timeframe"),
+    [
+        (datetime(2026, 1, 4, tzinfo=UTC), "H1"),
+        (datetime(2026, 7, 5, tzinfo=UTC), "H1"),
+    ],
+)
+def test_midweek_first_and_current_incomplete_weeks_are_skipped(
+    week_start: datetime,
+    timeframe: str,
+) -> None:
+    _open_candle, last_candle = _week_boundary_candles(week_start, timeframe)
+    midweek = _candle(week_start + pd.Timedelta(days=2))
+    partial_checks = _weekly_boundary_checks(
+        (midweek, last_candle),
+        timeframe=timeframe,
+        coverage_start_utc=midweek.time,
+        current_utc=week_start + pd.Timedelta(days=7),
+    )
+    current_week = (
+        datetime(2026, 7, 5, tzinfo=UTC)
+        if week_start.month == 7
+        else datetime(2026, 11, 8, tzinfo=UTC)
+    )
+    current_open, current_last = _week_boundary_candles(current_week, timeframe)
+    incomplete_checks = _weekly_boundary_checks(
+        (current_open, current_last),
+        timeframe=timeframe,
+        current_utc=current_week + pd.Timedelta(days=2),
+    )
+
+    assert [check.status for check in partial_checks] == ["SKIPPED"]
+    assert "partial first week" in partial_checks[0].detail
+    assert [check.status for check in incomplete_checks] == ["SKIPPED"]
+    assert "current incomplete week" in incomplete_checks[0].detail
+
+
+def test_coverage_uses_expected_start_and_last_closed_bar(capsys) -> None:
+    expected_start = datetime(2020, 11, 8, tzinfo=UTC)
+    week_start = datetime(2026, 11, 8, tzinfo=UTC)
+    candles = _week_boundary_candles(week_start, "H1")
+
+    _validate_one_cache(
+        candles,
+        "EURUSD",
+        "H1",
+        SESSIONS,
+        (),
+        6,
+        coverage_start_utc=expected_start,
+        current_utc=datetime(2026, 11, 14, tzinfo=UTC),
+    )
+
+    output = capsys.readouterr().out
+    assert "coverage 6." in output
+    assert "coverage shortfall" not in output
+
+
+def test_weekly_summary_is_reported_per_symbol_and_timeframe(capsys) -> None:
+    week_start = datetime(2026, 1, 4, tzinfo=UTC)
+    candles = _week_boundary_candles(week_start, "H4")
+    _validate_one_cache(
+        candles,
+        "EURUSD",
+        "H4",
+        SESSIONS,
+        (),
+        0,
+        current_utc=week_start + timedelta(days=7),
+    )
+
+    assert "WEEKLY SUMMARY EURUSD H4: PASS=1 EXPLAINED=0 SKIPPED=0 FAIL=0" in (
+        capsys.readouterr().out
+    )
