@@ -11,3 +11,6 @@ start_utc,end_utc,reason,approved_by,approved_on
 2024-12-31T22:00:00+00:00,2025-01-01T22:00:00+00:00,New Year closure 2024-25,Lefa,2026-11-12
 2025-12-24T22:00:00+00:00,2025-12-25T22:00:00+00:00,Christmas closure 2025,Lefa,2026-11-12
 2025-12-31T22:00:00+00:00,2026-01-01T22:00:00+00:00,New Year closure 2025-26,Lefa,2026-11-12
+2020-12-24T19:00:00+00:00,2020-12-25T22:00:00+00:00,early close and reopen Christmas 2020,Lefa,2026-11-12
+2020-12-31T19:00:00+00:00,2021-01-01T22:00:00+00:00,early close and reopen New Year 2020-21,Lefa,2026-11-12
+2021-12-02T09:00:00+00:00,2021-12-02T14:00:00+00:00,broker data outage Thursday 2 December 2021 (all six pairs),Lefa,2026-11-12
